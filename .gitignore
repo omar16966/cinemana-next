@@ -1,0 +1,31 @@
+# =============================================================================
+# .gitignore — مشروع سينمانا نكست (Go + Wails + Vue/Vite)
+# =============================================================================
+
+# ملفات البناء الناتجة (تُبنى محلياً بـ go build / wails build)
+*.exe
+*.exe~
+*.syso
+*.test
+*.out
+
+# إخراج واجهة Vite (يُولّد أثناء wails build)
+desktop/frontend/dist/
+
+# روابط Wails المولّدة تلقائياً (نستخدم window.go مباشرة)
+desktop/frontend/wailsjs/
+
+# اعتماديات Node
+node_modules/
+
+# مجلد بناء Wails: نحفظ فيه الأيقونة والبيانات (build/windows/*)
+# ونستثني المخرجات التنفيذية فقط
+desktop/build/bin/
+
+# ملفات النظام والمحررات
+Thumbs.db
+.DS_Store
+*.swp
+
+# ملف علامة wails المولد
+desktop/frontend/package.json.md5

@@ -1,0 +1,70 @@
+@import "tailwindcss";
+/* خطوط عربية مدمجة محلياً (تعمل بلا إنترنت) */
+@import "./assets/fonts/fonts.css";
+
+/* عرض بطاقة البوستر الأساسي — يتحكم فيه إعداد "حجم البطاقات" */
+:root {
+  --card-w: 150px;
+}
+
+/* =============================================================================
+   نظام الألوان (Tailwind v4 @theme): وضع داكن سينمائي دائم.
+   الأسماء تصبح أدوات Tailwind جاهزة: bg-ink-900، text-accent-500...
+   ============================================================================= */
+@theme {
+  --color-ink-950: #07090d; /* الخلفية العامة */
+  --color-ink-900: #0c1016; /* أسطح بارزة قليلاً */
+  --color-ink-800: #121821; /* بطاقات وحقول */
+  --color-ink-700: #1a2230; /* حدود/عناصر تفاعلية */
+  --color-ink-600: #263144; /* تمرير/تمييز هادئ */
+  --color-accent-600: #b30710; /* أحمر سينمائي (حالات الضغط) */
+  --color-accent-500: #e50914; /* الأساسي: أزرار التشغيل */
+  --color-accent-400: #ff1f2c; /* تمرير فوق الأزرار */
+  --color-gold-400: #f5c518; /* التقييم بالنجوم */
+  --font-sans: "Segoe UI", "Noto Sans Arabic", Tahoma, ui-sans-serif, system-ui, sans-serif;
+}
+
+/* شريط تمرير داكن رقيق يناسب الواجهة */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #263144;
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #33415c;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* هيكل السكلتون (loading placeholders) مع لمعان متحرك */
+@keyframes shimmer {
+  100% {
+    transform: translateX(-100%);
+  }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(100%);
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.06), transparent);
+  animation: shimmer 1.4s infinite;
+}
+
+/* انتقالات بسيطة بين الشاشات */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.18s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
