@@ -441,6 +441,10 @@ export function createUserList(name) {
 }
 
 export function deleteUserList(id) {
+  // حذف القائمة لا رجعة فيه: نطلب تأكيداً (إن توفر confirm في الـ WebView).
+  const list = store.userLists.find((l) => l.id === id)
+  if (!list) return
+  if (typeof window.confirm === 'function' && !window.confirm(`حذف القائمة «${list.name}» (${list.items.length} عمل)؟`)) return
   store.userLists = store.userLists.filter((l) => l.id !== id)
   persist(saveUserLists(store.userLists))
   // إن كنا نعرض هذه القائمة حالياً نعود للرئيسية.
@@ -707,8 +711,10 @@ export async function saveSettings(s) {
     store.settings = await api.getSettings() // القيم المطبَّعة كما حُفظت فعلاً
     store.settingsOpen = false
     store.notice = 'تم حفظ الإعدادات'
+    return true
   } catch (e) {
     fail(e)
+    return false
   }
 }
 

@@ -5,8 +5,7 @@
 //     الأجنبية/العربية/الأنمي...) — تُجلب الصفوف كسولاً عند اقتراب ظهورها.
 //   - أثناء البحث: شبكة نتائج البحث كما كانت.
 // =============================================================================
-import { store, loadMore, moreBrowse, clearBrowse } from '../store.js'
-import { HOME_ROWS } from '../store.js'
+import { store, loadMore, moreBrowse, clearBrowse, HOME_ROWS } from '../store.js'
 import PosterCard from './PosterCard.vue'
 import SkeletonCard from './SkeletonCard.vue'
 import TopSection from './TopSection.vue'

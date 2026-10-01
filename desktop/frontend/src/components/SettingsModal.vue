@@ -4,7 +4,7 @@
 // للخدمة، وترويسة User-Agent. تُحفظ في ملف إعدادات النظام عبر الباك-اند
 // (settings.go) ويسري مفعولها فوراً دون إعادة تشغيل.
 // =============================================================================
-import { reactive } from 'vue'
+import { reactive, ref, onMounted, onBeforeUnmount } from 'vue'
 import {
   store,
   closeSettings,
@@ -17,6 +17,50 @@ import {
 
 // نسخة عمل محلية: لا نلمس الإعدادات الحية إلا عند الحفظ الفعلي.
 const form = reactive({ ...store.settings })
+const saving = ref(false)
+const formError = ref('')
+
+// تحقق أولي في الواجهة (الباك-اند يعيد التحقق ويرفض غير الصالح).
+function validate() {
+  const base = (form.base_url || '').trim()
+  if (base) {
+    try {
+      const u = new URL(base.includes('://') ? base : 'https://' + base)
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return 'العنوان الأساسي يجب أن يبدأ بـ http أو https'
+    } catch {
+      return 'العنوان الأساسي غير صالح'
+    }
+  }
+  if (/[\r\n]/.test(form.user_agent || '')) return 'User-Agent لا يجوز أن يحوي أسطراً جديدة'
+  return ''
+}
+
+async function save() {
+  if (saving.value) return // يمنع النقر المزدوج
+  formError.value = validate()
+  if (formError.value) return
+  // تعطيل التحقق من الشهادة يشمل كل الطلبات (الـ API والبث): تأكيد صريح.
+  if (
+    form.insecure_tls &&
+    !store.settings?.insecure_tls &&
+    typeof window.confirm === 'function' &&
+    !window.confirm('تخطي التحقق من شهادة TLS يعطّل حماية الاتصال لكل الطلبات (البيانات والفيديو). هل تريد المتابعة؟')
+  ) {
+    return
+  }
+  saving.value = true
+  try {
+    await saveSettings({ ...form })
+  } finally {
+    saving.value = false
+  }
+}
+
+function onKey(e) {
+  if (e.key === 'Escape') closeSettings()
+}
+onMounted(() => window.addEventListener('keydown', onKey))
+onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
@@ -104,11 +148,13 @@ const form = reactive({ ...store.settings })
         </label>
       </div>
 
+      <p v-if="formError" class="mt-4 text-sm text-red-400">{{ formError }}</p>
+
       <div class="mt-6 flex justify-end gap-3">
         <button @click="closeSettings" class="rounded-lg px-5 py-2.5 text-sm text-zinc-400 transition hover:text-white">
           إلغاء
         </button>
-        <button @click="saveSettings({ ...form })" class="rounded-lg bg-accent-500 px-6 py-2.5 text-sm font-bold text-white transition hover:bg-accent-400">
+        <button @click="save" :disabled="saving" class="rounded-lg bg-accent-500 px-6 py-2.5 text-sm font-bold text-white transition hover:bg-accent-400 disabled:opacity-50">
           حفظ
         </button>
       </div>
