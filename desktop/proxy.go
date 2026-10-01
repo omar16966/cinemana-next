@@ -26,10 +26,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -44,18 +47,56 @@ import (
 	cinemana "cinemana-probe/core/cinemana"
 )
 
+// allowedDomains نطاقات المزود المسموح بها عبر الوكيل (النطاق نفسه أو أي
+// نطاق فرعي له — بحد نقطة فاصل، فلا يُقبل مثل evilshabakaty.cc).
+var allowedDomains = []string{"shabakaty.cc", "shabakaty.com"}
+
+// maxPlaylistBytes / maxSubtitleBytes سقف أحجام الاستجابات المحوّلة في الذاكرة.
+const (
+	maxPlaylistBytes = 4 << 20
+	maxSubtitleBytes = 10 << 20
+)
+
+// copyBufPool مخازن نسخ مُعاد استخدامها بدل تخصيص 64KB لكل طلب.
+var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 64*1024); return &b }}
+
 // Streamer خادم البث المحلي.
 type Streamer struct {
 	opts    cinemana.ClientOptions
 	client  *http.Client // عميل بث: بلا مهلة كلية (الأفلام طويلة!) مع مهلة رأس استجابة فقط
-	mux     *http.ServeMux
 	srv     *http.Server
-	ln      net.Listener
 	baseURL string
-	mu      sync.Mutex
+	port    int
+	mu      sync.RWMutex // يحمي opts وclient عند تحديث الإعدادات
 }
 
-// NewStreamer يبدأ الاستماع على 127.0.0.1:0 (منفذ عشوائي يختاره النظام).
+// makeStreamClient يبني عميل بث من العميل العادي: نفس تجاوز البروكسي وDNS
+// من النواة، لكن بلا مهلة كلية (client.Timeout) لأن تشغيل فيلم قد
+// يستغرق ساعتين؛ نكتفي بمهلة على وصول رأس الاستجابة لاكتشاف تعطل الـ CDN
+// مبكراً. كما تُفحص كل عملية إعادة توجيه ضمن قائمة النطاقات المسموحة حتى
+// لا يتحول تحويل مفتوح على نطاق المزود إلى SSRF.
+func (s *Streamer) makeStreamClient(client *http.Client) *http.Client {
+	c := *client
+	c.Timeout = 0
+	if t, ok := c.Transport.(*http.Transport); ok {
+		tc := t.Clone()
+		tc.ResponseHeaderTimeout = 20 * time.Second
+		c.Transport = tc
+	}
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return errors.New("تحويلات كثيرة")
+		}
+		if !s.allowedURL(req.URL) {
+			return fmt.Errorf("تحويل إلى نطاق غير مسموح: %s", req.URL.Hostname())
+		}
+		return nil
+	}
+	return &c
+}
+
+// NewStreamer يبدأ الاستماع على 127.0.0.1:0 (منفذ عشوائي يختاره النظام)
+// ويتوقف تلقائياً عند إلغاء ctx.
 func NewStreamer(ctx context.Context, opts cinemana.ClientOptions, client *http.Client) (*Streamer, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,35 +104,31 @@ func NewStreamer(ctx context.Context, opts cinemana.ClientOptions, client *http.
 	}
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	// عميل بث مخصص: نفس تجاوز البروكسي وDNS من النواة، لكن بلا مهلة
-	// كلية (client.Timeout) لأن تشغيل فيلم قد يستغرق ساعتين؛ نكتفي
-	// بمهلة على وصول رأس الاستجابة لاكتشاف تعطل الـ CDN مبكراً.
-	streamClient := *client
-	streamClient.Timeout = 0
-	if t, ok := streamClient.Transport.(*http.Transport); ok {
-		tc := t.Clone()
-		tc.ResponseHeaderTimeout = 20 * time.Second
-		streamClient.Transport = tc
-	}
+	s := &Streamer{opts: opts, port: port}
+	s.client = s.makeStreamClient(client)
 
-	s := &Streamer{opts: opts, client: &streamClient}
-	s.mux = http.NewServeMux()
-	s.mux.HandleFunc("/stream", s.handleStream)
-	s.mux.HandleFunc("/sub", s.handleSubtitle)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", s.guard(s.handleStream))
+	mux.HandleFunc("/sub", s.guard(s.handleSubtitle))
 
 	s.srv = &http.Server{
-		Handler:           s.mux,
+		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
 		// لا WriteTimeout عمداً: النقل قد يستمر طويلاً على روابط بطيئة.
 	}
-	s.ln = ln
 	s.baseURL = fmt.Sprintf("http://127.0.0.1:%d", port) // يُستخدم في StreamURL/SubtitleURL
 
 	go func() {
 		// Serve يعيد خطأ عند Stop() — نتجاهله بهدوء.
 		_ = s.srv.Serve(ln)
 	}()
-	_ = ctx
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			s.Stop()
+		}()
+	}
 	return s, nil
 }
 
@@ -102,13 +139,47 @@ func (s *Streamer) Stop() {
 
 // UpdateOptions تحديث الخيارات/العميل بعد حفظ الإعدادات دون إعادة تشغيل.
 func (s *Streamer) UpdateOptions(opts cinemana.ClientOptions, client *http.Client) {
+	var sc *http.Client
+	if client != nil {
+		sc = s.makeStreamClient(client)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.opts = opts
-	if client != nil {
-		c := *client
-		c.Timeout = 0
-		s.client = &c
+	if sc != nil {
+		s.client = sc
+	}
+}
+
+// snapshot نسخة متسقة من الخيارات والعميل الحاليين.
+func (s *Streamer) snapshot() (cinemana.ClientOptions, *http.Client) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.opts, s.client
+}
+
+// guard يقيّد الطلبات: GET/HEAD فقط، وترويسة Host يجب أن تكون عنوان
+// الحلقة المحلية (يمنع DNS rebinding)، ويجيب على OPTIONS (CORS preflight).
+func (s *Streamer) guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, _, err := net.SplitHostPort(r.Host)
+		if err != nil || (host != "127.0.0.1" && host != "localhost") {
+			http.Error(w, "مضيف غير مسموح", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
+		switch r.Method {
+		case http.MethodGet, http.MethodHead:
+			next(w, r)
+		case http.MethodOptions:
+			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Range")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+			http.Error(w, "طريقة غير مسموحة", http.StatusMethodNotAllowed)
+		}
 	}
 }
 
@@ -130,15 +201,38 @@ func (s *Streamer) SubtitleURL(remote string) string {
 }
 
 // allowedHost فحص أن النطاق الهدف ضمن نطاقات المزود (منع استخدام
-// التطبيق كبروكسي مفتوح لأي موقع آخر).
+// التطبيق كبروكسي مفتوح لأي موقع آخر). المطابقة بحد نقطة فاصل.
 func (s *Streamer) allowedHost(host string) bool {
-	h := strings.ToLower(host)
-	if strings.HasSuffix(h, "shabakaty.cc") || strings.HasSuffix(h, "shabakaty.com") {
-		return true
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	if h == "" {
+		return false
+	}
+	for _, d := range allowedDomains {
+		if h == d || strings.HasSuffix(h, "."+d) {
+			return true
+		}
 	}
 	// النطاق الأساسي من الإعدادات (لو غيّره المستخدم لنطاق المزود).
-	if base, err := url.Parse(s.opts.BaseURL); err == nil && strings.EqualFold(h, base.Hostname()) {
+	opts, _ := s.snapshot()
+	if base, err := url.Parse(opts.BaseURL); err == nil && strings.EqualFold(h, base.Hostname()) {
 		return true
+	}
+	return false
+}
+
+// allowedURL فحص المخطط والنطاق معاً. http مسموح فقط لنطاق الإعدادات
+// الأساسي إن كان المستخدم قد حدده بـ http (شبكات محلية)، وإلا https فقط.
+func (s *Streamer) allowedURL(u *url.URL) bool {
+	if u == nil || !s.allowedHost(u.Hostname()) {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		return true
+	case "http":
+		opts, _ := s.snapshot()
+		base, err := url.Parse(opts.BaseURL)
+		return err == nil && base.Scheme == "http" && strings.EqualFold(u.Hostname(), base.Hostname())
 	}
 	return false
 }
@@ -153,10 +247,48 @@ func (s *Streamer) decodeTarget(raw string) (*url.URL, error) {
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
 		return nil, fmt.Errorf("رابط غير صالح")
 	}
-	if !s.allowedHost(u.Hostname()) {
+	if !s.allowedURL(u) {
 		return nil, fmt.Errorf("نطاق غير مسموح عبر الوكيل المحلي: %s", u.Hostname())
 	}
 	return u, nil
+}
+
+// newUpstreamRequest يبني طلباً للـ CDN بترويسات المحاكاة نفسها المستخدمة
+// مع واجهة الـ API.
+func (s *Streamer) newUpstreamRequest(r *http.Request, target *url.URL, forwardRange bool) (*http.Request, *http.Client, error) {
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	opts, client := s.snapshot()
+	upReq.Header.Set("User-Agent", opts.UserAgent)
+	upReq.Header.Set("Accept", "*/*")
+	if opts.AppID != "" {
+		upReq.Header.Set("X-Requested-With", opts.AppID)
+	}
+	if forwardRange {
+		// identity: لا نريد ضغطاً من الـ CDN حتى تبقى نطاقات Range دقيقة
+		// والبحث داخل الفيديو سليماً.
+		upReq.Header.Set("Accept-Encoding", "identity")
+		// تمرير رأس Range كما هو: عميل الفيديو يقول "أعطني البايتات من X
+		// إلى Y" ونمرر الرسالة حرفياً للـ CDN ونعيد 206 للمتصفح.
+		if rng := r.Header.Get("Range"); rng != "" {
+			upReq.Header.Set("Range", rng)
+		}
+	}
+	return upReq, client, nil
+}
+
+// readLimited يقرأ حتى limit بايت ويفشل إن زاد الجسم عنه (بدل القص الصامت).
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, fmt.Errorf("الاستجابة أكبر من الحد المسموح (%d بايت)", limit)
+	}
+	return body, nil
 }
 
 // handleStream نقطة /stream: وسيط شفاف مع ترويسات + دعم Range + m3u8.
@@ -166,34 +298,17 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	upReq, client, err := s.newUpstreamRequest(r, target, true)
 	if err != nil {
 		http.Error(w, "طلب غير صالح", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	opts, client := s.opts, s.client
-	s.mu.Unlock()
-
-	// ترويسات المحاكاة نفسها المستخدمة مع واجهة الـ API.
-	upReq.Header.Set("User-Agent", opts.UserAgent)
-	upReq.Header.Set("Accept", "*/*")
-	if opts.AppID != "" {
-		upReq.Header.Set("X-Requested-With", opts.AppID)
-	}
-	// identity: لا نريد ضغطاً من الـ CDN حتى تبقى نطاقات Range دقيقة
-	// والبحث داخل الفيديو سليماً.
-	upReq.Header.Set("Accept-Encoding", "identity")
-	// تمرير رأس Range كما هو: عميل الفيديو يقول "أعطني البايتات من X
-	// إلى Y" ونمرر الرسالة حرفياً للـ CDN ونعيد 206 للمتصفح.
-	if rng := r.Header.Get("Range"); rng != "" {
-		upReq.Header.Set("Range", rng)
-	}
 
 	resp, err := client.Do(upReq)
 	if err != nil {
-		http.Error(w, "فشل جلب الوسائط من المزود: "+err.Error(), http.StatusBadGateway)
+		// التفاصيل (تحوي الرابط الموقّع) تُسجَّل ولا تُعاد للمتصفح.
+		log.Printf("proxy: فشل جلب الوسائط: %v", err)
+		http.Error(w, "فشل جلب الوسائط من المزود", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -202,17 +317,24 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 	ct := resp.Header.Get("Content-Type")
 	isPlaylist := strings.Contains(strings.ToLower(ct), "mpegurl") || strings.HasSuffix(strings.ToLower(target.Path), ".m3u8")
 	if isPlaylist {
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, fmt.Sprintf("المزود أعاد HTTP %d لقائمة التشغيل", resp.StatusCode), http.StatusBadGateway)
+			return
+		}
+		body, err := readLimited(resp.Body, maxPlaylistBytes)
 		if err != nil {
+			log.Printf("proxy: قائمة التشغيل: %v", err)
 			http.Error(w, "فشل قراءة قائمة التشغيل", http.StatusBadGateway)
 			return
 		}
-		rewritten := rewriteM3U8(string(body), target, s.StreamURL)
+		// بعد التحويلات قد يختلف الرابط النهائي: نحل الروابط النسبية ضده.
+		rewritten := rewriteM3U8(string(body), resp.Request.URL, s.StreamURL)
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write([]byte(rewritten))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write([]byte(rewritten))
+		}
 		return
 	}
 
@@ -230,18 +352,19 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/octet-stream")
 		}
 	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(resp.StatusCode)
 
 	if r.Method == http.MethodHead {
 		return
 	}
 
-	// نسخ الجسم مع Flush دوري: يجعل البداية تصل للمتصفح فوراً بدل
-	// انتظار تعبئة مخازن داخلية — إحساس أسرع عند الضغط على تشغيل.
-	buf := make([]byte, 64*1024)
+	// نسخ الجسم مع Flush: الدفعة الأولى تُدفع فوراً (إحساس أسرع عند الضغط
+	// على تشغيل) ثم كل 512KB تقريباً.
+	bufp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufp)
+	buf := *bufp
 	flusher, _ := w.(http.Flusher)
-	written := 0
+	written, first := 0, true
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
@@ -249,9 +372,9 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 				return // العميل أغلق (أوقف التشغيل مثلاً) — طبيعي
 			}
 			written += n
-			if flusher != nil && written >= 512*1024 {
+			if flusher != nil && (first || written >= 512*1024) {
 				flusher.Flush()
-				written = 0
+				written, first = 0, false
 			}
 		}
 		if err != nil {
@@ -267,27 +390,28 @@ func (s *Streamer) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+	upReq, client, err := s.newUpstreamRequest(r, target, false)
 	if err != nil {
 		http.Error(w, "طلب غير صالح", http.StatusBadRequest)
 		return
 	}
-	s.mu.Lock()
-	opts, client := s.opts, s.client
-	s.mu.Unlock()
-	upReq.Header.Set("User-Agent", opts.UserAgent)
-	upReq.Header.Set("Accept", "*/*")
 
 	resp, err := client.Do(upReq)
 	if err != nil {
-		http.Error(w, "فشل جلب الترجمة: "+err.Error(), http.StatusBadGateway)
+		log.Printf("proxy: فشل جلب الترجمة: %v", err)
+		http.Error(w, "فشل جلب الترجمة", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+	// صفحة خطأ (404/403 HTML) يجب ألا تتحول إلى "ترجمة" صالحة.
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, fmt.Sprintf("المزود أعاد HTTP %d للترجمة", resp.StatusCode), http.StatusBadGateway)
+		return
+	}
+	body, err := readLimited(resp.Body, maxSubtitleBytes)
 	if err != nil {
+		log.Printf("proxy: الترجمة: %v", err)
 		http.Error(w, "فشل قراءة الترجمة", http.StatusBadGateway)
 		return
 	}
@@ -302,12 +426,11 @@ func (s *Streamer) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
-	// <track> يتطلب CORS حتماً — ترويسة تجعل الترجمة تعمل حتى لو تغير
-	// مصدر الصفحة مستقبلاً.
-	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(out)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(out)
+	}
 }
 
 // =============================================================================
@@ -340,7 +463,7 @@ func pad2(s string) string {
 // أنه windows-1256 (الترميز العربي الشائع في ملفات SRT القديمة).
 func decodeSubtitleBytes(data []byte) string {
 	// إزالة BOM إن وُجد.
-	data = []byte(strings.TrimPrefix(string(data), "\ufeff"))
+	data = bytes.TrimPrefix(data, []byte("\ufeff"))
 	if utf8.Valid(data) {
 		return string(data)
 	}
@@ -356,7 +479,7 @@ func decodeSubtitleBytes(data []byte) string {
 // {\an8} (تموضع) و{\i1} (مائل) — عرضها حرفياً يشوّه النص.
 var assTagRegex = regexp.MustCompile(`\{\\[^}]*\}`)
 
-// stripASSRemovalTags حذف وسوم ASS من نص الترجمة.
+// stripASSTags حذف وسوم ASS من نص الترجمة.
 func stripASSTags(text string) string {
 	return assTagRegex.ReplaceAllString(text, "")
 }
@@ -409,7 +532,8 @@ func rewriteM3U8(content string, baseURL *url.URL, wrap func(string) string) str
 		}
 		return baseURL.ResolveReference(u).String()
 	}
-	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	content = strings.ReplaceAll(strings.ReplaceAll(content, "\r\n", "\n"), "\r", "\n")
+	lines := strings.Split(content, "\n")
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		switch {
@@ -420,6 +544,9 @@ func rewriteM3U8(content string, baseURL *url.URL, wrap func(string) string) str
 			if uriAttrRegex.MatchString(trimmed) {
 				lines[i] = uriAttrRegex.ReplaceAllStringFunc(trimmed, func(m string) string {
 					inner := uriAttrRegex.FindStringSubmatch(m)[1]
+					if strings.HasPrefix(strings.ToLower(inner), "data:") {
+						return m // مفتاح/ملف مضمّن: لا يُمرَّر عبر الوكيل
+					}
 					return `URI="` + wrap(resolve(inner)) + `"`
 				})
 			}

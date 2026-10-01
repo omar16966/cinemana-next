@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,8 +53,12 @@ func loadSettings() Settings {
 	if err != nil {
 		return s // لا ملف بعد = إعدادات افتراضية
 	}
-	// ندمج فوق الافتراضيات حتى تبقى الحقول الناقصة سليمة.
-	_ = json.Unmarshal(data, &s)
+	// ندمج فوق الافتراضيات حتى تبقى الحقول الناقصة سليمة. الملف التالف
+	// لا يُطبَّق نصفه: نعود للافتراضيات كاملة ونسجل السبب.
+	if err := json.Unmarshal(data, &s); err != nil {
+		log.Printf("ملف الإعدادات تالف (%v) — استُخدمت الافتراضيات", err)
+		s = Settings{BaseURL: def.BaseURL, UserAgent: def.UserAgent}
+	}
 	if strings.TrimSpace(s.BaseURL) == "" {
 		s.BaseURL = def.BaseURL
 	}
@@ -69,17 +74,37 @@ func saveSettings(s Settings) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(p, data, 0o644); err != nil {
+	return writeFileAtomic(p, data, 0o600)
+}
+
+// writeFileAtomic يكتب إلى ملف مؤقت بجوار الهدف ثم يعيد تسميته: انقطاع
+// التيار أو الانهيار أثناء الكتابة لا يترك ملفاً مبتوراً.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
+	if err != nil {
 		return err
 	}
-	return nil
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // لا أثر له بعد نجاح Rename
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 // osLocalAppData مسار %LOCALAPPDATA% مع بديل آمن إن غاب المتغير.

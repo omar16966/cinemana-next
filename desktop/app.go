@@ -19,14 +19,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
@@ -42,7 +47,36 @@ type App struct {
 	opts     cinemana.ClientOptions
 	streamer *Streamer
 	settings Settings
-	mu       sync.Mutex // حماية إعادة بناء العميل عند حفظ الإعدادات
+	startErr error        // سبب تعذّر تشغيل وكيل البث (إن حدث)
+	mu       sync.RWMutex // يحمي client/opts/settings: Wails ينفذ الدوال المربوطة بالتوازي
+}
+
+// حدود أمان لمدخلات الدوال المربوطة ولملفات الاستيراد/التصدير.
+const (
+	maxCollectionLimit = 100
+	maxUserDataBytes   = 10 << 20
+)
+
+// appState نسخة متسقة من حالة التطبيق تُؤخذ تحت القفل ثم تُستخدم بلا قفل.
+type appState struct {
+	ctx      context.Context
+	client   *http.Client
+	opts     cinemana.ClientOptions
+	settings Settings
+}
+
+// wailsCtx سياق Wails (مطلوب لحوارات النظام).
+func (a *App) wailsCtx() context.Context {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.ctx
+}
+
+// state يأخذ لقطة متسقة (سياق الطلبات + العميل + الخيارات + الإعدادات).
+func (a *App) state() appState {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return appState{ctx: a.reqCtx, client: a.client, opts: a.opts, settings: a.settings}
 }
 
 // NewApp تُنشئ البنية بقيم افتراضية؛ الإعدادات المحفوظة تُحمَّل في startup.
@@ -52,52 +86,77 @@ func NewApp() *App {
 
 // startup تُستدعى مرة واحدة قبل عرض النافذة.
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
 	// سياق مستقل عن دورة حياة Wails لطلبات الشبكة الطويلة (البث).
-	a.reqCtx, a.cancel = context.WithCancel(context.Background())
+	reqCtx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.ctx = ctx
+	a.reqCtx, a.cancel = reqCtx, cancel
+	a.mu.Unlock()
 	a.rebuild()
+
 	// وكيل البث: يستمع على 127.0.0.1 بمنفذ عشوائي متاح.
-	s, err := NewStreamer(a.reqCtx, a.opts, a.client)
+	st := a.state()
+	s, err := NewStreamer(reqCtx, st.opts, st.client)
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if err != nil {
-		// منفذ عشوائي يعني أن الفشل شبه مستحيل؛ إن حدث نبقيه ظاهراً في الكونسول.
-		fmt.Println("تحذير: تعذر تشغيل وكيل البث المحلي:", err)
+		// منفذ عشوائي يعني أن الفشل شبه مستحيل؛ نحفظ السبب ليظهر للمستخدم
+		// عند أول محاولة تشغيل بدل روابط فارغة صامتة.
+		log.Printf("تعذر تشغيل وكيل البث المحلي: %v", err)
+		a.startErr = err
+		return
 	}
 	a.streamer = s
 }
 
 // shutdown تنظيف الموارد عند إغلاق النافذة.
 func (a *App) shutdown(ctx context.Context) {
-	if a.cancel != nil {
-		a.cancel()
+	a.mu.RLock()
+	cancel, streamer := a.cancel, a.streamer
+	a.mu.RUnlock()
+	if cancel != nil {
+		cancel()
 	}
-	if a.streamer != nil {
-		a.streamer.Stop()
+	if streamer != nil {
+		streamer.Stop()
 	}
 }
 
+// buildOptions يشتق خيارات العميل من الإعدادات (دالة نقية بلا حالة).
+func buildOptions(set Settings) cinemana.ClientOptions {
+	opts := cinemana.DefaultOptions()
+	if base, err := cinemana.NormalizeBaseURL(set.BaseURL); err == nil {
+		opts.BaseURL = base
+	}
+	if set.UserAgent != "" {
+		opts.UserAgent = set.UserAgent
+	}
+	opts.InsecureTLS = set.InsecureTLS
+	return opts
+}
+
 // rebuild يبني عميل HTTP من الإعدادات الحالية (يُستدعى عند الإقلاع
-// وبعد أي حفظ للإعدادات ليأخذ التغييرات مفعول فوراً).
+// وبعد أي حفظ للإعدادات ليأخذ التغييرات مفعول فوراً). لا يُعدَّل أي شيء
+// إذا فشل البناء، فلا تتباعد opts عن client.
 func (a *App) rebuild() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.mu.RLock()
+	set := a.settings
+	a.mu.RUnlock()
 
-	base, err := cinemana.NormalizeBaseURL(a.settings.BaseURL)
+	opts := buildOptions(set)
+	client, _, err := cinemana.BuildClient(opts)
 	if err != nil {
-		base = cinemana.DefaultOptions().BaseURL
-	}
-	a.opts = cinemana.DefaultOptions()
-	a.opts.BaseURL = base
-	if a.settings.UserAgent != "" {
-		a.opts.UserAgent = a.settings.UserAgent
-	}
-	a.opts.InsecureTLS = a.settings.InsecureTLS
-
-	client, _, err := cinemana.BuildClient(a.opts)
-	if err != nil {
-		// BuildClient لا يفشل عملياً (لا اتصال هنا)؛ الحفاظ على عميل قديم أفضل من لا شيء.
+		log.Printf("تعذر بناء عميل HTTP: %v", err)
 		return
 	}
-	a.client = client
+
+	a.mu.Lock()
+	old := a.client
+	a.opts, a.client = opts, client
+	a.mu.Unlock()
+	if old != nil {
+		old.CloseIdleConnections() // لا نترك اتصالات العميل القديم معلّقة
+	}
 }
 
 // =============================================================================
@@ -106,7 +165,8 @@ func (a *App) rebuild() {
 
 // Search بحث سريع عن فيلم/مسلسل. mediaType: "all" | "movie" | "series".
 func (a *App) Search(query, mediaType string, page int) ([]cinemana.MediaSummary, error) {
-	items, _, err := cinemana.Search(a.reqCtx, a.client, a.opts, query, mediaType, page)
+	st := a.state()
+	items, _, err := cinemana.Search(st.ctx, st.client, st.opts, query, mediaType, page)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +175,8 @@ func (a *App) Search(query, mediaType string, page int) ([]cinemana.MediaSummary
 
 // GetDetails تفاصيل عمل (عنوان/بوستر/وصف/سنة/ترجمات/تصنيفات).
 func (a *App) GetDetails(nb string) (*cinemana.DetailsOutput, error) {
-	info, _, err := cinemana.GetVideoInfo(a.reqCtx, a.client, a.opts, nb)
+	st := a.state()
+	info, _, err := cinemana.GetVideoInfo(st.ctx, st.client, st.opts, nb)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +185,8 @@ func (a *App) GetDetails(nb string) (*cinemana.DetailsOutput, error) {
 
 // GetEpisodes مواسم مسلسل وحلقاته (لكل حلقة nb يُستخدم مع GetPlayback).
 func (a *App) GetEpisodes(seriesNB string) ([]cinemana.Season, error) {
-	episodes, _, err := cinemana.GetEpisodes(a.reqCtx, a.client, a.opts, seriesNB)
+	st := a.state()
+	episodes, _, err := cinemana.GetEpisodes(st.ctx, st.client, st.opts, seriesNB)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +199,15 @@ func (a *App) GetEpisodes(seriesNB string) ([]cinemana.Season, error) {
 // نجلب زيادة عن الحدد ثم ندمج المكررات ونقص إلى الحد المطلوب، حتى لا
 // يقلّ عددها الظاهر بعد الدمج.
 func (a *App) GetCollection(key string, limit int) ([]cinemana.MediaSummary, error) {
-	items, err := cinemana.GetCollection(a.reqCtx, a.client, a.opts, cinemana.CollectionKey(key), limit+8)
+	// الحد يأتي من الواجهة: نقيّده (القيم السالبة كانت تسبب panic عند القص).
+	if limit < 1 {
+		limit = 12
+	}
+	if limit > maxCollectionLimit {
+		limit = maxCollectionLimit
+	}
+	st := a.state()
+	items, err := cinemana.GetCollection(st.ctx, st.client, st.opts, cinemana.CollectionKey(key), limit+8)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +222,8 @@ func (a *App) GetCollection(key string, limit int) ([]cinemana.MediaSummary, err
 func (a *App) Browse(f cinemana.BrowseFilters) ([]cinemana.MediaSummary, error) {
 	// نجلب صفحة أكبر قليلاً ثم ندمج المكررات ونقص إلى 30، ليبقى منطق
 	// "المزيد" في الواجهة (صفحة ممتلئة = يوجد المزيد) صحيحاً.
-	items, err := cinemana.Browse(a.reqCtx, a.client, a.opts, f, 36)
+	st := a.state()
+	items, err := cinemana.Browse(st.ctx, st.client, st.opts, f, 36)
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +236,8 @@ func (a *App) Browse(f cinemana.BrowseFilters) ([]cinemana.MediaSummary, error) 
 
 // GetCategories تصنيفات الخدمة (للقائمة المنسدلة في لوحة الفلترة).
 func (a *App) GetCategories() ([]cinemana.CategoryItem, error) {
-	return cinemana.GetMainCategories(a.reqCtx, a.client, a.opts)
+	st := a.state()
+	return cinemana.GetMainCategories(st.ctx, st.client, st.opts)
 }
 
 // =============================================================================
@@ -174,9 +246,16 @@ func (a *App) GetCategories() ([]cinemana.CategoryItem, error) {
 
 // ExportUserData يعرض حوار حفظ ملف ويكتب فيه ما تمرره الواجهة من بياناتها
 // المحلية (المفضلة + القوائم الخاصة + المشاهدات الأخيرة) كنص JSON.
-// data هو الـ JSON الجاهز من الواجهة؛ الدالة مسؤولة عن الحوار والملف فقط.
+// data هو الـ JSON الجاهز من الواجهة؛ الدالة مسؤولة عن الحوار والملف فقط،
+// وتتحقق أن النص JSON صالح وبحجم معقول، وتكتب بشكل ذري (لا ملف نصف مكتوب).
 func (a *App) ExportUserData(data string) (string, error) {
-	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	if len(data) > maxUserDataBytes {
+		return "", errors.New("البيانات أكبر من الحد المسموح للتصدير")
+	}
+	if !json.Valid([]byte(data)) {
+		return "", errors.New("البيانات المراد تصديرها ليست JSON صالحاً")
+	}
+	path, err := runtime.SaveFileDialog(a.wailsCtx(), runtime.SaveDialogOptions{
 		DefaultFilename: "cinemana-next-data.json",
 		Filters: []runtime.FileFilter{
 			{DisplayName: "ملف JSON (*.json)", Pattern: "*.json"},
@@ -188,16 +267,20 @@ func (a *App) ExportUserData(data string) (string, error) {
 	if path == "" {
 		return "", nil // المستخدم ألغى الحوار — ليس خطأ
 	}
-	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+	if filepath.Ext(path) == "" {
+		path += ".json"
+	}
+	if err := writeFileAtomic(path, []byte(data), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
 }
 
 // ImportUserData يعرض حوار اختيار ملف JSON ويعيد محتوى نصياً للواجهة
-// لتدمجه في بياناتها المحلية (الدمج والتحقق في الواجهة).
+// لتدمجه في بياناتها المحلية (الدمج والتحقق في الواجهة). نرفض الملفات
+// الضخمة وغير JSON قبل تمريرها عبر الجسر لتفادي تجمّد الواجهة.
 func (a *App) ImportUserData() (string, error) {
-	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+	path, err := runtime.OpenFileDialog(a.wailsCtx(), runtime.OpenDialogOptions{
 		Filters: []runtime.FileFilter{
 			{DisplayName: "ملف JSON (*.json)", Pattern: "*.json"},
 		},
@@ -208,9 +291,19 @@ func (a *App) ImportUserData() (string, error) {
 	if path == "" {
 		return "", nil // أُلغي الحوار
 	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.Size() > maxUserDataBytes {
+		return "", errors.New("الملف أكبر من الحد المسموح (10 ميغابايت)")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
+	}
+	if !json.Valid(data) {
+		return "", errors.New("الملف ليس JSON صالحاً")
 	}
 	return string(data), nil
 }
@@ -258,6 +351,7 @@ type PlaybackInfo struct {
 // إن لم ينتج المعرّف الأساسي أي ملف تشغيل نجرّب البدائل بالترتيب
 // تلقائياً بدل إظهار رسالة خطأ.
 func (a *App) GetPlayback(nb string, alts []string) (*PlaybackInfo, error) {
+	st := a.state()
 	candidates := append([]string{nb}, alts...)
 	var lastErr error
 	for i, candidate := range candidates {
@@ -275,7 +369,11 @@ func (a *App) GetPlayback(nb string, alts []string) (*PlaybackInfo, error) {
 		}
 		// بين المرشحين فاصل قصير حتى لا نضغط على الخدمة.
 		if i < len(candidates)-1 {
-			time.Sleep(150 * time.Millisecond)
+			select {
+			case <-time.After(150 * time.Millisecond):
+			case <-st.ctx.Done():
+				return nil, st.ctx.Err()
+			}
 		}
 	}
 	if lastErr == nil {
@@ -287,6 +385,17 @@ func (a *App) GetPlayback(nb string, alts []string) (*PlaybackInfo, error) {
 // buildPlayback يجلب التفاصيل وملفات فيديو معرّف واحد ويبني PlaybackInfo.
 // يجلب الاثنين على التوازي لتقليل زمن الانتظار قبل ظهور زر التشغيل.
 func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
+	st := a.state()
+	a.mu.RLock()
+	streamer, startErr := a.streamer, a.startErr
+	a.mu.RUnlock()
+	if streamer == nil {
+		if startErr == nil {
+			startErr = errors.New("وكيل البث غير جاهز")
+		}
+		return nil, fmt.Errorf("وكيل البث المحلي غير متاح: %w", startErr)
+	}
+
 	var (
 		info              *cinemana.VideoInfo
 		files             []cinemana.VideoFile
@@ -297,11 +406,11 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		info, _, infoErr = cinemana.GetVideoInfo(a.reqCtx, a.client, a.opts, nb)
+		info, _, infoErr = cinemana.GetVideoInfo(st.ctx, st.client, st.opts, nb)
 	}()
 	go func() {
 		defer wg.Done()
-		files, _, filesErr = cinemana.GetVideoFiles(a.reqCtx, a.client, a.opts, nb)
+		files, _, filesErr = cinemana.GetVideoFiles(st.ctx, st.client, st.opts, nb)
 	}()
 	wg.Wait()
 
@@ -315,12 +424,12 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 	// فشل التفاصيل ليس قاتلاً (بدون عنوان/ترجمات احتياطية فقط)؛ لكن نحاول
 	// إعادة المحاولة بشكل متزامن إن فشلت مع نجاح الملفات لسبب عابر.
 	if infoErr != nil {
-		if info, _, infoErr = cinemana.GetVideoInfo(a.reqCtx, a.client, a.opts, nb); infoErr != nil {
+		if info, _, infoErr = cinemana.GetVideoInfo(st.ctx, st.client, st.opts, nb); infoErr != nil {
 			info = nil
 		}
 	}
 
-	out, err := cinemana.NormalizeVideos(a.reqCtx, a.client, a.opts, nb, files)
+	out, err := cinemana.NormalizeVideos(st.ctx, st.client, st.opts, nb, files)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +454,7 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 			Height:     q.Height,
 			Bandwidth:  q.Bandwidth,
 			Codecs:     q.Codecs,
-			LocalURL:   a.streamer.StreamURL(q.URL),
+			LocalURL:   streamer.StreamURL(q.URL),
 			RemoteURL:  q.URL,
 		})
 	}
@@ -354,7 +463,7 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 			Language:  s.Language,
 			LangCode:  s.LangCode,
 			Format:    s.Format,
-			LocalURL:  a.streamer.SubtitleURL(s.URL),
+			LocalURL:  streamer.SubtitleURL(s.URL),
 			RemoteURL: s.URL,
 		})
 	}
@@ -371,20 +480,42 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 // OpenInMPV يفتح الرابط الموقّع مباشرة في مشغل mpv الخارجي بضغطة زر،
 // مع تمرير نفس ترويسات المحاكاة (User-Agent وX-Requested-With) كوسيطات،
 // وملف الترجمة إن اختير — إذ يدعم mpv جلب الترجمات من روابط http مباشرة.
+//
+// الروابط تأتي من الواجهة، لذلك نقبل فقط روابط https على نطاقات المزود
+// (أو رابط الوكيل المحلي)؛ وإلا لفتح mpv ملفات محلية أو بروتوكولات
+// مثل ytdl:// أو سحب ملف ترجمة من مسار تعسفي.
 func (a *App) OpenInMPV(videoURL, subtitleURL, title string) error {
-	path := a.findMPV()
+	st := a.state()
+	a.mu.RLock()
+	streamer := a.streamer
+	a.mu.RUnlock()
+	if !mediaURLAllowed(streamer, videoURL) {
+		return errors.New("رابط الفيديو غير مسموح")
+	}
+	if subtitleURL != "" && !mediaURLAllowed(streamer, subtitleURL) {
+		return errors.New("رابط الترجمة غير مسموح")
+	}
+	path := findMPV(st.settings)
 	if path == "" {
 		return fmt.Errorf("لم يتم العثور على مشغل mpv. ثبّته (مثلاً: winget install mpv) أو حدد مساره من الإعدادات")
 	}
 
+	// تنظيف العنوان من محارف التحكم (أسطر جديدة...) قبل تمريره كوسيط.
+	title = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, title)
+
 	// نفس ترويسات المحاكاة المستخدمة في واجهة الـ API، لئلا يرفض السيرفر
-	// طلب الفيديو القادم من مشغل خارجي بم تعريف.
+	// طلب الفيديو القادم من مشغل خارجي بلا تعريف.
 	args := []string{
 		"--force-media-title=" + title,
-		"--user-agent=" + a.opts.UserAgent,
+		"--user-agent=" + st.opts.UserAgent,
 	}
-	if a.opts.AppID != "" {
-		args = append(args, "--http-header-fields=X-Requested-With: "+a.opts.AppID)
+	if st.opts.AppID != "" {
+		args = append(args, "--http-header-fields=X-Requested-With: "+st.opts.AppID)
 	}
 	if subtitleURL != "" {
 		args = append(args, "--sub-file="+subtitleURL)
@@ -402,11 +533,41 @@ func (a *App) OpenInMPV(videoURL, subtitleURL, title string) error {
 	return nil
 }
 
+// mediaURLAllowed هل الرابط https على نطاق مزود، أو رابط الوكيل المحلي؟
+func mediaURLAllowed(s *Streamer, raw string) bool {
+	if s == nil || raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, s.baseURL+"/") {
+		return true
+	}
+	u, err := url.Parse(raw)
+	return err == nil && s.allowedURL(u)
+}
+
+// validMPVPath تحقق أن المسار المحفوظ يشير فعلاً إلى مشغل mpv (اسم الملف
+// mpv أو mpv.exe) وليس ملفاً تنفيذياً تعسفياً — الإعداد قابل للتعديل
+// من الواجهة.
+func validMPVPath(p string) error {
+	if p == "" {
+		return nil
+	}
+	base := strings.ToLower(filepath.Base(p))
+	base = strings.TrimSuffix(strings.TrimSuffix(base, ".exe"), ".com")
+	if base != "mpv" {
+		return errors.New("مسار mpv يجب أن يشير إلى الملف mpv أو mpv.exe")
+	}
+	if _, err := exec.LookPath(p); err != nil {
+		return fmt.Errorf("تعذر العثور على mpv في المسار المحدد: %w", err)
+	}
+	return nil
+}
+
 // findMPV إيجاد مشغل mpv: المسار المحفوظ في الإعدادات أولاً، ثم PATH،
 // ثم مواضع التثبيت الشائعة على ويندوز.
-func (a *App) findMPV() string {
-	if a.settings.MPVPath != "" {
-		if p, err := exec.LookPath(a.settings.MPVPath); err == nil {
+func findMPV(set Settings) string {
+	if set.MPVPath != "" && validMPVPath(set.MPVPath) == nil {
+		if p, err := exec.LookPath(set.MPVPath); err == nil {
 			return p
 		}
 	}
@@ -431,26 +592,43 @@ func (a *App) findMPV() string {
 // =============================================================================
 
 // GetSettings قراءة الإعدادات الحالية (تُستدعى عند فتح نافذة الإعدادات).
-func (a *App) GetSettings() Settings { return a.settings }
+func (a *App) GetSettings() Settings { return a.state().settings }
 
 // SaveSettings حفظ الإعدادات وإعادة بناء العميل لتصبح سارية فوراً.
+// نتحقق من المدخلات قبل الحفظ حتى لا يتباعد المحفوظ عن الفعلي.
 func (a *App) SaveSettings(s Settings) error {
-	if strings.TrimSpace(s.BaseURL) == "" {
+	s.BaseURL = strings.TrimSpace(s.BaseURL)
+	s.UserAgent = strings.TrimSpace(s.UserAgent)
+	s.MPVPath = strings.TrimSpace(s.MPVPath)
+	if s.BaseURL == "" {
 		s.BaseURL = cinemana.DefaultOptions().BaseURL
+	}
+	base, err := cinemana.NormalizeBaseURL(s.BaseURL)
+	if err != nil {
+		return fmt.Errorf("العنوان الأساسي غير صالح: %w", err)
+	}
+	s.BaseURL = base
+	if strings.ContainsAny(s.UserAgent, "\r\n") {
+		return errors.New("User-Agent لا يجوز أن يحوي أسطراً جديدة")
+	}
+	if err := validMPVPath(s.MPVPath); err != nil {
+		return err
 	}
 	if err := saveSettings(s); err != nil {
 		return err
 	}
+	a.mu.Lock()
 	a.settings = s
+	a.mu.Unlock()
 	a.rebuild()
 
 	// الوكيل يحمل نسخة من الخيارات للترويسات؛ نحدّثها دون إيقاف الخادم.
-	if a.streamer != nil {
-		a.streamer.UpdateOptions(a.opts, a.client)
+	st := a.state()
+	a.mu.RLock()
+	streamer := a.streamer
+	a.mu.RUnlock()
+	if streamer != nil {
+		streamer.UpdateOptions(st.opts, st.client)
 	}
 	return nil
 }
-
-// =============================================================================
-// أدوات صغيرة
-// =============================================================================

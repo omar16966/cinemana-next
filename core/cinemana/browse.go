@@ -24,14 +24,35 @@
 package cinemana
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// حدود وثوابت الاستعراض.
+const (
+	pageSize      = 30 // عدد عناصر صفحة offset في نقاط videosByCategory*
+	maxLimit      = 200
+	latestPerPage = 48
+	maxTopOffset  = 90 // لا نتجاوز 4 صفحات (offset 0..90) في قوائم Top
+	pageCacheTTL  = 2 * time.Minute
+	pageCacheMax  = 64
+)
+
+// ErrUnknownCollection مفتاح قائمة غير معروف (يُعامل كخطأ استخدام في CLI).
+var ErrUnknownCollection = errors.New("مفتاح قائمة غير معروف")
+
+// numericID قيم الفلاتر الرقمية (تصنيف/لغة/نوع) — تمنع حقن معاملات في الرابط.
+var numericID = regexp.MustCompile(`^[0-9]{1,6}$`)
 
 // ثوابت الاستعراض (مستخرجة من فحص تطبيق الويب الرسمي).
 const (
@@ -71,23 +92,96 @@ type flexiblePage struct {
 }
 
 func (p *flexiblePage) UnmarshalJSON(data []byte) error {
-	var arr []SearchItem
-	if err := json.Unmarshal(data, &arr); err == nil {
-		p.Items = arr
-		return nil
+	// نقرر الصيغة من أول محرف فلا تُخفى أخطاء الأنواع داخل المصفوفة.
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return json.Unmarshal(trimmed, &p.Items)
 	}
 	var obj struct {
 		Info []SearchItem `json:"info"`
 	}
-	if err := json.Unmarshal(data, &obj); err != nil {
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
 		return err
 	}
 	p.Items = obj.Info
 	return nil
 }
 
+// =============================================================================
+// ذاكرة مؤقتة قصيرة الأمد + دمج الطلبات المتزامنة
+//
+// الصفحة الرئيسية تطلب عدة صفوف دفعة واحدة، وكل صف "latest_*" يجلب نفس
+// الصفحات الأربع: بدون هذا نرسل ~24 طلباً بدل ~8. الإدخال ينتهي بعد دقيقتين
+// (الروابط الموقّعة تبقى صالحة أطول بكثير) ولا تُخزَّن الأخطاء.
+// =============================================================================
+
+type cacheEntry struct {
+	done  chan struct{}
+	items []SearchItem
+	err   error
+	at    time.Time
+}
+
+var pageCache = struct {
+	sync.Mutex
+	m map[string]*cacheEntry
+}{m: map[string]*cacheEntry{}}
+
+func pruneCacheLocked(now time.Time) {
+	for k, e := range pageCache.m {
+		select {
+		case <-e.done:
+			if now.Sub(e.at) > pageCacheTTL {
+				delete(pageCache.m, k)
+			}
+		default:
+		}
+	}
+	for k := range pageCache.m { // سقف الحجم: نُخلي ما يلزم عشوائياً
+		if len(pageCache.m) < pageCacheMax {
+			break
+		}
+		delete(pageCache.m, k)
+	}
+}
+
 // fetchJSONPage طلب موحّد يعيد عناصر نقطة استعراض واحدة.
 func fetchJSONPage(ctx context.Context, client *http.Client, opts ClientOptions, endpoint string) ([]SearchItem, error) {
+	now := time.Now()
+	pageCache.Lock()
+	if e, ok := pageCache.m[endpoint]; ok {
+		pageCache.Unlock()
+		select {
+		case <-e.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if e.err == nil && time.Since(e.at) <= pageCacheTTL {
+			return append([]SearchItem(nil), e.items...), nil
+		}
+		// منتهي الصلاحية (أو فشل الرائد): نكمل بجلب جديد دون تخزين.
+		return fetchPageUncached(ctx, client, opts, endpoint)
+	}
+	pruneCacheLocked(now)
+	e := &cacheEntry{done: make(chan struct{})}
+	pageCache.m[endpoint] = e
+	pageCache.Unlock()
+
+	items, err := fetchPageUncached(ctx, client, opts, endpoint)
+	e.items, e.err, e.at = items, err, time.Now()
+	close(e.done)
+	if err != nil {
+		pageCache.Lock()
+		if pageCache.m[endpoint] == e {
+			delete(pageCache.m, endpoint)
+		}
+		pageCache.Unlock()
+		return nil, err
+	}
+	return append([]SearchItem(nil), items...), nil
+}
+
+func fetchPageUncached(ctx context.Context, client *http.Client, opts ClientOptions, endpoint string) ([]SearchItem, error) {
 	var page flexiblePage
 	if _, err := getJSON(ctx, client, opts, endpoint, &page); err != nil {
 		return nil, err
@@ -95,33 +189,43 @@ func fetchJSONPage(ctx context.Context, client *http.Client, opts ClientOptions,
 	return page.Items, nil
 }
 
-// fetchLatest يجلب أحدث الأفلام أو المسلسلات من صفحات متتالية ويدمجها
-// (مع إزالة التكرار) — latestMovies/latestSeries لا تدعم فلترة لغة،
+// fetchLatest يجلب أحدث الأفلام أو المسلسلات من صفحات متتالية (بالتوازي)
+// ويدمجها مع إزالة التكرار — latestMovies/latestSeries لا تدعم فلترة لغة،
 // فالدمج يتيح الفلترة محلياً بكمية كافية من العناصر.
 func fetchLatest(ctx context.Context, client *http.Client, opts ClientOptions, listName string, pages int) ([]SearchItem, error) {
-	merged := make([]SearchItem, 0, 48*pages)
-	seen := map[string]bool{}
-	for p := 0; p < pages; p++ {
-		endpoint := strings.TrimRight(opts.BaseURL, "/") +
-			"/api/android/" + listName + "/level/" + browseLevel + "/itemsPerPage/48/page/" + strconv.Itoa(p) + "/"
-		items, err := fetchJSONPage(ctx, client, opts, endpoint)
-		if err != nil {
-			if p == 0 {
-				return nil, err // الصفحة الأولى ضرورية؛ بقية الصفحات تحسين اختياري
-			}
-			break
-		}
-		if len(items) == 0 {
-			break
-		}
-		for _, it := range items {
-			if !seen[it.NB] {
-				seen[it.NB] = true
-				merged = append(merged, it)
-			}
-		}
+	type result struct {
+		items []SearchItem
+		err   error
 	}
-	return merged, nil
+	results := make([]result, pages)
+	var wg sync.WaitGroup
+	for p := 0; p < pages; p++ {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			endpoint := strings.TrimRight(opts.BaseURL, "/") +
+				"/api/android/" + listName + "/level/" + browseLevel + "/itemsPerPage/" + strconv.Itoa(latestPerPage) +
+				"/page/" + strconv.Itoa(p) + "/"
+			items, err := fetchJSONPage(ctx, client, opts, endpoint)
+			results[p] = result{items, err}
+		}(p)
+	}
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return nil, err // إلغاء/انتهاء مهلة: لا نعيد بيانات جزئية بصمت
+	}
+	if results[0].err != nil {
+		return nil, results[0].err // الصفحة الأولى ضرورية؛ بقية الصفحات تحسين اختياري
+	}
+	merged := make([]SearchItem, 0, latestPerPage*pages)
+	for _, r := range results {
+		if r.err != nil || len(r.items) == 0 {
+			break // صفحة فاشلة/فارغة: نتوقف عند آخر متتالية سليمة
+		}
+		merged = append(merged, r.items...)
+	}
+	return dedupe(merged), nil
 }
 
 // =============================================================================
@@ -169,17 +273,43 @@ func sortByStarsDesc(items []SearchItem) {
 	})
 }
 
-// dedupe إزالة التكرار حسب nb.
+// dedupe إزالة التكرار حسب nb دون تعديل الشريحة الأصلية. العناصر بلا
+// معرّف تُحتفظ بها كما هي (لا تُدمج معاً).
 func dedupe(items []SearchItem) []SearchItem {
-	seen := map[string]bool{}
-	out := items[:0]
+	seen := make(map[string]bool, len(items))
+	out := make([]SearchItem, 0, len(items))
 	for _, it := range items {
-		if !seen[it.NB] {
+		if it.NB != "" {
+			if seen[it.NB] {
+				continue
+			}
 			seen[it.NB] = true
-			out = append(out, it)
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// interleave يدمج قائمتين بالتناوب (للعرض المختلط أفلام/مسلسلات).
+func interleave(a, b []SearchItem) []SearchItem {
+	out := make([]SearchItem, 0, len(a)+len(b))
+	for i := 0; i < len(a) || i < len(b); i++ {
+		if i < len(a) {
+			out = append(out, a[i])
+		}
+		if i < len(b) {
+			out = append(out, b[i])
 		}
 	}
 	return out
+}
+
+// truncate يقص إلى limit بأمان (limit موجب مضمون من المستدعي).
+func truncate(items []SearchItem, limit int) []SearchItem {
+	if len(items) > limit {
+		return items[:limit]
+	}
+	return items
 }
 
 // =============================================================================
@@ -189,6 +319,9 @@ func dedupe(items []SearchItem) []SearchItem {
 func GetCollection(ctx context.Context, client *http.Client, opts ClientOptions, key CollectionKey, limit int) ([]SearchItem, error) {
 	if limit <= 0 {
 		limit = 12
+	}
+	if limit > maxLimit {
+		limit = maxLimit
 	}
 
 	switch key {
@@ -229,17 +362,16 @@ func GetCollection(ctx context.Context, client *http.Client, opts ClientOptions,
 		if err != nil {
 			return nil, err
 		}
-		merged := dedupe(append(movies, series...))
-		if len(merged) > limit {
-			merged = merged[:limit]
-		}
-		return merged, nil
+		// تناوب أفلام/مسلسلات: الدمج المتتالي كان يملأ القائمة بالأفلام وحدها.
+		return truncate(dedupe(interleave(movies, series)), limit), nil
 
 	case ColTopMovies:
-		return fetchTopByCategory(ctx, client, opts, categoryAllMovies, "1", limit)
+		items, err := fetchTopByCategory(ctx, client, opts, categoryAllMovies, "1", limit)
+		return truncate(items, limit), err
 
 	case ColTopSeries:
-		return fetchTopByCategory(ctx, client, opts, categoryAllMovies, "2", limit)
+		items, err := fetchTopByCategory(ctx, client, opts, categoryAllMovies, "2", limit)
+		return truncate(items, limit), err
 
 	case ColTopAnime:
 		// ندمج أفلام ومسلسلات الأنمي ونرتبها تنازلياً بالتقييم.
@@ -251,15 +383,12 @@ func GetCollection(ctx context.Context, client *http.Client, opts ClientOptions,
 		if err != nil {
 			return nil, err
 		}
-		merged := dedupe(append(movies, series...))
+		merged := dedupe(append(append([]SearchItem(nil), movies...), series...))
 		sortByStarsDesc(merged)
-		if len(merged) > limit {
-			merged = merged[:limit]
-		}
-		return merged, nil
+		return truncate(merged, limit), nil
 
 	default:
-		return nil, &usageKeyError{msg: "مفتاح قائمة غير معروف: " + string(key)}
+		return nil, errors.Join(ErrUnknownCollection, errors.New(string(key)))
 	}
 }
 
@@ -267,14 +396,17 @@ func GetCollection(ctx context.Context, client *http.Client, opts ClientOptions,
 // الحد المطلوب — يدعم صفحات "المزيد" الكاملة (أكثر من 30 عنصراً).
 func fetchTopByCategory(ctx context.Context, client *http.Client, opts ClientOptions, categoryID, videoKind string, limit int) ([]SearchItem, error) {
 	var all []SearchItem
-	for offset := 0; len(all) < limit && offset < 90; offset += 30 {
-		endpoint := strings.TrimRight(opts.BaseURL, "/") +
-			"/api/android/videosByCategory?categoryID=" + categoryID +
-			"&orderby=" + sortTopRated + "&videoKind=" + videoKind +
-			"&offset=" + strconv.Itoa(offset) + "&level=" + browseLevel
+	for offset := 0; len(all) < limit && offset <= maxTopOffset; offset += pageSize {
+		q := url.Values{}
+		q.Set("categoryID", categoryID)
+		q.Set("orderby", sortTopRated)
+		q.Set("videoKind", videoKind)
+		q.Set("offset", strconv.Itoa(offset))
+		q.Set("level", browseLevel)
+		endpoint := strings.TrimRight(opts.BaseURL, "/") + "/api/android/videosByCategory?" + q.Encode()
 		items, err := fetchJSONPage(ctx, client, opts, endpoint)
 		if err != nil {
-			if offset == 0 {
+			if offset == 0 || ctx.Err() != nil {
 				return nil, err
 			}
 			break
@@ -286,11 +418,6 @@ func fetchTopByCategory(ctx context.Context, client *http.Client, opts ClientOpt
 	}
 	return dedupe(all), nil
 }
-
-// usageKeyError خطأ مفتاح غير معروف (رسالة واضحة في الواجهة).
-type usageKeyError struct{ msg string }
-
-func (e *usageKeyError) Error() string { return e.msg }
 
 // =============================================================================
 // لوحة الفلترة (يمين الواجهة): تصفح المحتوى بمعايير متعددة.
@@ -345,13 +472,32 @@ func Browse(ctx context.Context, client *http.Client, opts ClientOptions, f Brow
 	if limit <= 0 {
 		limit = 30
 	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
 	if f.Page <= 0 {
 		f.Page = 1
 	}
+	f.Query = strings.TrimSpace(f.Query)
+	f.CategoryID = strings.TrimSpace(f.CategoryID)
+	f.LanguageID = strings.TrimSpace(f.LanguageID)
+	f.VideoKind = strings.TrimSpace(f.VideoKind)
+
+	// قيم الفلاتر تصل من الواجهة/سطر الأوامر: نقبل الأرقام فقط حتى لا يُحقن
+	// معامل إضافي في الرابط (مثل "7&level=0").
+	for name, v := range map[string]string{"category_id": f.CategoryID, "language_id": f.LanguageID, "video_kind": f.VideoKind} {
+		if v != "" && !numericID.MatchString(v) {
+			return nil, &FilterError{Field: name, Value: v}
+		}
+	}
+	if _, ok := kindToSearchType(f.VideoKind); f.VideoKind != "" && !ok {
+		return nil, &FilterError{Field: "video_kind", Value: f.VideoKind}
+	}
 
 	// ---- فلترة اللغة: مسار منفصل (videosByCategoryAndLanguage) ----
-	// لا تتوفر لغة في AdvancedSearch؛ وهي لا تجمع مع البحث النصي.
-	if f.LanguageID != "" && strings.TrimSpace(f.Query) == "" {
+	// لا تتوفر لغة في AdvancedSearch؛ وهي لا تجمع مع البحث النصي (في تلك
+	// الحالة نفلتر اللغة محلياً بعد البحث — انظر أسفل).
+	if f.LanguageID != "" && f.Query == "" {
 		category := f.CategoryID
 		if category == "" {
 			category = categoryAllMovies // 56: يعمل كـ"كل التصنيفات" في هذه النقطة (مؤكد بالفحص)
@@ -360,27 +506,34 @@ func Browse(ctx context.Context, client *http.Client, opts ClientOptions, f Brow
 		if f.VideoKind == "" {
 			kinds = []string{"1", "2"} // الكل: ندمج أفلاماً ومسلسلات
 		}
-		var merged []SearchItem
+		lists := make([][]SearchItem, 0, len(kinds))
 		for i, kind := range kinds {
-			// كل نوع له ترقيم مستقل بoffset=30 لكل صفحة.
-			offset := strconv.Itoa((f.Page - 1) * 30)
-			endpoint := strings.TrimRight(opts.BaseURL, "/") +
-				"/api/android/videosByCategoryAndLanguage?category_id=" + category +
-				"&language_id=" + f.LanguageID + "&videoKind=" + kind +
-				"&orderby=NEWVIDEOS&level=" + browseLevel + "&offset=" + offset
+			// كل نوع له ترقيم مستقل: offset = 30 لكل صفحة.
+			q := url.Values{}
+			q.Set("category_id", category)
+			q.Set("language_id", f.LanguageID)
+			q.Set("videoKind", kind)
+			q.Set("orderby", "NEWVIDEOS")
+			q.Set("level", browseLevel)
+			q.Set("offset", strconv.Itoa((f.Page-1)*pageSize))
+			endpoint := strings.TrimRight(opts.BaseURL, "/") + "/api/android/videosByCategoryAndLanguage?" + q.Encode()
 			items, err := fetchJSONPage(ctx, client, opts, endpoint)
 			if err != nil {
-				if i == 0 {
+				if i == 0 || ctx.Err() != nil {
 					return nil, err
 				}
 				continue
 			}
-			merged = append(merged, items...)
+			lists = append(lists, items)
 		}
-		merged = dedupe(merged)
-		if len(merged) > limit {
-			merged = merged[:limit]
+		var merged []SearchItem
+		if len(lists) == 2 {
+			merged = interleave(lists[0], lists[1]) // تناوب: لا تطغى الأفلام على المسلسلات
+		} else if len(lists) == 1 {
+			merged = lists[0]
 		}
+		// التقييم والسنة غير مدعومين في هذا المسار: نطبقهما محلياً.
+		merged = filterLimit(dedupe(merged), limit, localFilter(f))
 		return merged, nil
 	}
 
@@ -390,11 +543,11 @@ func Browse(ctx context.Context, client *http.Client, opts ClientOptions, f Brow
 	if t, ok := kindToSearchType(f.VideoKind); ok {
 		q.Set("type", t)
 	}
-	if s := strings.TrimSpace(f.Query); s != "" {
-		q.Set("videoTitle", s)
+	if f.Query != "" {
+		q.Set("videoTitle", f.Query)
 	}
-	if c := strings.TrimSpace(f.CategoryID); c != "" {
-		q.Set("category_id", c)
+	if f.CategoryID != "" {
+		q.Set("category_id", f.CategoryID)
 	}
 	if s := strings.TrimSpace(f.MinStar); s != "" && s != "0" {
 		q.Set("star", s)
@@ -405,7 +558,7 @@ func Browse(ctx context.Context, client *http.Client, opts ClientOptions, f Brow
 			from = "1900"
 		}
 		if to == "" {
-			to = "2030"
+			to = strconv.Itoa(time.Now().Year() + 1)
 		}
 		q.Set("year", from+","+to)
 	}
@@ -419,8 +572,36 @@ func Browse(ctx context.Context, client *http.Client, opts ClientOptions, f Brow
 		return nil, err
 	}
 	items = dedupe(items)
-	if len(items) > limit {
-		items = items[:limit]
+	if f.LanguageID != "" { // بحث نصي + لغة: الفلترة المحلية بدل تجاهل اللغة
+		items = filterLimit(items, len(items), func(it SearchItem) bool { return withLanguage(it, f.LanguageID) })
 	}
-	return items, nil
+	return truncate(items, limit), nil
+}
+
+// FilterError قيمة فلتر غير صالحة (رسالة واضحة بدل طلب مشوّه).
+type FilterError struct{ Field, Value string }
+
+func (e *FilterError) Error() string {
+	return "قيمة غير صالحة للفلتر " + e.Field + ": " + strconv.Quote(e.Value)
+}
+
+// localFilter فلترة التقييم الأدنى ونطاق السنوات محلياً (للمسار الذي لا يدعمها).
+func localFilter(f BrowseFilters) func(SearchItem) bool {
+	minStar, _ := strconv.ParseFloat(strings.TrimSpace(f.MinStar), 64)
+	from, _ := strconv.Atoi(strings.TrimSpace(f.YearFrom))
+	to, _ := strconv.Atoi(strings.TrimSpace(f.YearTo))
+	return func(it SearchItem) bool {
+		if minStar > 0 {
+			if st, _ := strconv.ParseFloat(strings.TrimSpace(it.Stars), 64); st < minStar {
+				return false
+			}
+		}
+		if from > 0 || to > 0 {
+			y, err := strconv.Atoi(strings.TrimSpace(it.Year))
+			if err != nil || (from > 0 && y < from) || (to > 0 && y > to) {
+				return false
+			}
+		}
+		return true
+	}
 }

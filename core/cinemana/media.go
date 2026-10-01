@@ -16,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -144,8 +145,8 @@ func kindToType(kind string) string {
 
 // videoKind تمييز نوع رابط الفيديو من امتداده.
 func videoKind(raw string) string {
-	u := strings.ToLower(strings.ReplaceAll(raw, "\\", ""))
-	u = strings.SplitN(u, "?", 2)[0] // نتجاهل معاملات الرابط الموقّع
+	u := strings.ToLower(CleanURL(raw))
+	u = strings.SplitN(strings.SplitN(u, "#", 2)[0], "?", 2)[0] // نتجاهل معاملات الرابط الموقّع
 	switch {
 	case strings.HasSuffix(u, ".m3u8"):
 		return "hls"
@@ -161,8 +162,8 @@ func videoKind(raw string) string {
 // subtitleFormat تمييز امتداد الترجمة؛ يُرجع "" إذا لم تكن ترجمة أصلاً
 // (هذا يصفّي الروابط الوهمية مثل defaultImages/loading.gif).
 func subtitleFormat(raw string) string {
-	u := strings.ToLower(strings.ReplaceAll(raw, "\\", ""))
-	u = strings.SplitN(u, "?", 2)[0]
+	u := strings.ToLower(CleanURL(raw))
+	u = strings.SplitN(strings.SplitN(u, "#", 2)[0], "?", 2)[0]
 	switch {
 	case strings.HasSuffix(u, ".srt"):
 		return "srt"
@@ -178,7 +179,7 @@ func normalizeTranslations(list []Translation) []SubtitleTrack {
 	out := make([]SubtitleTrack, 0, len(list))
 	for _, t := range list {
 		if f := subtitleFormat(t.File); f != "" {
-			out = append(out, SubtitleTrack{Language: t.Name, LangCode: t.Type, Format: f, URL: t.File})
+			out = append(out, SubtitleTrack{Language: t.Name, LangCode: t.Type, Format: f, URL: CleanURL(t.File)})
 		}
 	}
 	return out
@@ -202,22 +203,28 @@ func NormalizeSearch(items []SearchItem) []MediaSummary {
 			Type:       kindToType(it.Kind),
 			Year:       it.Year,
 			Rating:     it.Stars,
-			Poster:     it.ImgObjUrl,
-			Thumbnail:  it.ImgThumbObjUrl,
+			Poster:     CleanURL(it.ImgObjUrl),
+			Thumbnail:  CleanURL(it.ImgThumbObjUrl),
 			Categories: cats,
 		}
 
 		// مفتاح الدمج: العنوان (كبير/صغير موحّد) + السنة + النوع.
 		title := strings.ToLower(strings.TrimSpace(it.EnTitle))
 		if title == "" {
-			title = strings.TrimSpace(it.ArTitle)
+			title = strings.ToLower(strings.TrimSpace(it.ArTitle))
 		}
-		key := title + "|" + it.Year + "|" + it.Kind
-		if idx, ok := byKey[key]; ok {
-			out[idx].Alts = append(out[idx].Alts, it.NB)
-			continue
+		// بلا عنوان لا نملك أساساً للدمج: نبقي العنصر مستقلاً بدل ضمّ أعمال
+		// غير مرتبطة تحت مفتاح "||".
+		if title != "" {
+			key := title + "|" + it.Year + "|" + it.Kind
+			if idx, ok := byKey[key]; ok {
+				if out[idx].ID != it.NB && !slices.Contains(out[idx].Alts, it.NB) {
+					out[idx].Alts = append(out[idx].Alts, it.NB)
+				}
+				continue
+			}
+			byKey[key] = len(out)
 		}
-		byKey[key] = len(out)
 		out = append(out, summary)
 	}
 	return out
@@ -225,6 +232,9 @@ func NormalizeSearch(items []SearchItem) []MediaSummary {
 
 // NormalizeDetails تحويل تفاصيل العمل الخام إلى المخرجات المنظمة.
 func NormalizeDetails(v *VideoInfo) *DetailsOutput {
+	if v == nil {
+		return &DetailsOutput{Subtitles: []SubtitleTrack{}}
+	}
 	title := v.ArTitle
 	if strings.TrimSpace(title) == "" {
 		title = v.EnTitle
@@ -241,7 +251,7 @@ func NormalizeDetails(v *VideoInfo) *DetailsOutput {
 	if len(subs) == 0 {
 		for _, raw := range []string{v.ArTranslationFilePath, v.EnTranslationFilePath} {
 			if f := subtitleFormat(raw); f != "" {
-				subs = append(subs, SubtitleTrack{Format: f, URL: raw})
+				subs = append(subs, SubtitleTrack{Format: f, URL: CleanURL(raw)})
 			}
 		}
 	}
@@ -254,8 +264,8 @@ func NormalizeDetails(v *VideoInfo) *DetailsOutput {
 		Type:             kindToType(v.Kind),
 		Year:             v.Year,
 		Rating:           v.Stars,
-		PosterURL:        v.ImgObjUrl,
-		ThumbnailURL:     v.ImgThumbObjUrl,
+		PosterURL:        CleanURL(v.ImgObjUrl),
+		ThumbnailURL:     CleanURL(v.ImgThumbObjUrl),
 		DescriptionAr:    strings.TrimSpace(v.ArContent),
 		DescriptionEn:    strings.TrimSpace(v.EnContent),
 		DurationSec:      v.Duration,
@@ -271,6 +281,12 @@ func NormalizeDetails(v *VideoInfo) *DetailsOutput {
 // NormalizeVideos تحويل قائمة الملفات الخام إلى مخرجات منظمة، مع تحليل
 // أي قائمة HLS عند العثور على رابط m3u8.
 func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOptions, nb string, files []VideoFile) (*VideosOutput, error) {
+	return NormalizeVideosWith(ctx, client, opts, nb, files, true)
+}
+
+// NormalizeVideosWith مثل NormalizeVideos مع التحكم في جلب/تحليل قوائم HLS
+// (parseHLS=false يتجنب الطلب الشبكي تماماً).
+func NormalizeVideosWith(ctx context.Context, client *http.Client, opts ClientOptions, nb string, files []VideoFile, parseHLS bool) (*VideosOutput, error) {
 	out := &VideosOutput{
 		ID:        nb,
 		Qualities: make([]VideoQuality, 0, len(files)),
@@ -281,7 +297,7 @@ func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOption
 		q := VideoQuality{
 			Resolution: f.Resolution,
 			Kind:       videoKind(f.VideoURL),
-			URL:        f.VideoURL,
+			URL:        CleanURL(f.VideoURL),
 		}
 		if strings.EqualFold(f.Container, "mp4") && q.Kind == "other" {
 			// بعض القيم القديمة قد تحذف الامتداد؛ نعتمد container كخطة بديلة.
@@ -290,8 +306,8 @@ func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOption
 		out.Qualities = append(out.Qualities, q)
 
 		// إذا وجدنا قائمة HLS رئيسية نحللها لعرض مستويات الجودة الداخلية.
-		if q.Kind == "hls" && out.HLS == nil {
-			info, err := FetchAndParseHLS(ctx, client, opts, f.VideoURL)
+		if parseHLS && q.Kind == "hls" && out.HLS == nil {
+			info, err := FetchAndParseHLS(ctx, client, opts, q.URL)
 			if err != nil {
 				out.Notes = append(out.Notes, fmt.Sprintf("تعذر تحليل قائمة HLS: %v", err))
 				continue
@@ -299,6 +315,9 @@ func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOption
 			out.HLS = info
 			// ندمج مستويات الجودة من القائمة داخل qualities أيضاً لعرض موحّد.
 			for _, v := range info.Variants {
+				if v.URL == "" {
+					continue // STREAM-INF بلا رابط: لا قيمة لها في القائمة
+				}
 				w, h := parseResolution(v.Resolution)
 				out.Qualities = append(out.Qualities, VideoQuality{
 					Resolution: v.Resolution,
@@ -319,8 +338,8 @@ func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOption
 	// ترتيب الجودات تنازلياً: حسب الارتفاع أولاً (1080p قبل 720p) ثم
 	// سرعة البت لقوائم HLS التي لا تحمل دقة رقمية.
 	sort.SliceStable(out.Qualities, func(i, j int) bool {
-		hi, bwi := resRank(out.Qualities[i].Resolution, out.Qualities[i].Bandwidth)
-		hj, bwj := resRank(out.Qualities[j].Resolution, out.Qualities[j].Bandwidth)
+		hi, bwi := resRank(out.Qualities[i])
+		hj, bwj := resRank(out.Qualities[j])
 		if hi != hj {
 			return hi > hj
 		}
@@ -329,13 +348,17 @@ func NormalizeVideos(ctx context.Context, client *http.Client, opts ClientOption
 	return out, nil
 }
 
-// resRank إعطاء ترتيب رقمي للدقة "720p" أو سرعة بت بديلة لقوائم HLS.
-func resRank(res string, bandwidth int) (height, bw int) {
-	h := strings.TrimSuffix(strings.ToUpper(res), "P")
-	if n, err := strconv.Atoi(h); err == nil {
-		height = n
+// resRank ترتيب رقمي: الارتفاع (من "720p" أو من Height المحلَّل لقوائم HLS
+// ذات الدقة "1920x1080") ثم سرعة البت.
+func resRank(q VideoQuality) (height, bw int) {
+	height = q.Height
+	if height == 0 {
+		h := strings.TrimSuffix(strings.ToUpper(strings.TrimSpace(q.Resolution)), "P")
+		if n, err := strconv.Atoi(h); err == nil {
+			height = n
+		}
 	}
-	return height, bandwidth
+	return height, q.Bandwidth
 }
 
 // parseResolution تحويل "1920x1080" إلى عرض وارتفاع رقميين.
@@ -374,8 +397,12 @@ func NormalizeEpisodes(episodes []Episode) []Season {
 		})
 		seasons = append(seasons, Season{Number: num, Episodes: eps})
 	}
-	sort.SliceStable(seasons, func(i, j int) bool {
-		return episodeNum(seasons[i].Number) < episodeNum(seasons[j].Number)
+	sort.Slice(seasons, func(i, j int) bool {
+		ni, nj := episodeNum(seasons[i].Number), episodeNum(seasons[j].Number)
+		if ni != nj {
+			return ni < nj
+		}
+		return seasons[i].Number < seasons[j].Number // ترتيب ثابت (مصدره map عشوائي)
 	})
 	return seasons
 }
@@ -446,7 +473,9 @@ func ParseM3U8(content string, base *url.URL) *HLSInfo {
 
 		case strings.HasPrefix(line, "#EXTINF:"):
 			// مقطع في قائمة media: نجمع مدته لعرض المجموع.
-			if d, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimPrefix(line, "#EXTINF:"), ","), 64); err == nil {
+			// الصيغة القياسية: #EXTINF:<المدة>,<عنوان اختياري>
+			dur, _, _ := strings.Cut(strings.TrimPrefix(line, "#EXTINF:"), ",")
+			if d, err := strconv.ParseFloat(strings.TrimSpace(dur), 64); err == nil {
 				info.DurationSec += d
 				info.Segments++
 			}
@@ -508,7 +537,7 @@ func resolveAgainst(base *url.URL, ref string) string {
 	if base == nil || ref == "" {
 		return ref
 	}
-	u, err := url.Parse(strings.ReplaceAll(ref, "\\", ""))
+	u, err := url.Parse(CleanURL(ref))
 	if err != nil {
 		return ref
 	}
