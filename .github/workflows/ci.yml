@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go (vet + test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # go:embed في desktop/main.go يتطلب وجود frontend/dist (يُبنى في wails build).
+      # نضع ملفاً مؤقتاً: الاختبارات لا تقدّم الواجهة فعلياً.
+      - name: Stub embedded frontend
+        run: |
+          mkdir -p desktop/frontend/dist
+          echo '<!doctype html>' > desktop/frontend/dist/index.html
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then echo "ملفات غير منسقة:"; echo "$out"; exit 1; fi
+
+      - name: go vet
+        run: |
+          go vet ./core/... .
+          cd desktop && go vet .
+
+      - name: go test (race)
+        run: |
+          go test -race -count=1 ./core/...
+          cd desktop && go test -race -count=1 .
+
+      - name: go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  frontend:
+    name: Frontend (build + test + audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # ثغرات الاعتماديات التي تدخل الحزمة النهائية فقط (ليس أدوات التطوير).
+      - name: npm audit (production)
+        run: npm audit --omit=dev --audit-level=high
