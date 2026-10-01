@@ -10,6 +10,7 @@
 import { ref } from 'vue'
 import {
   store,
+  goHome,
   openCollection,
   createUserList,
   deleteUserList,
@@ -34,7 +35,7 @@ function create() {
   >
     <!-- الرئيسية -->
     <button
-      @click="store.view = 'home'"
+      @click="goHome"
       class="flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-semibold transition"
       :class="store.view === 'home' ? 'bg-ink-700 text-white' : 'text-zinc-400 hover:bg-ink-800 hover:text-white'"
     >

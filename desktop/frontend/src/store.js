@@ -16,6 +16,11 @@ import {
   saveFavorites,
   loadUserLists,
   saveUserLists,
+  safeGet,
+  safeSet,
+  pickCardFields,
+  normalizeCards,
+  normalizeLists,
 } from './services/lists.js'
 
 const RECENT_KEY = 'cinemana_recent'
@@ -53,6 +58,7 @@ export const store = reactive({
 
   // ---------- شاشة التفاصيل ----------
   currentItem: null,
+  detailsFrom: 'home', // الشاشة التي فُتحت منها التفاصيل (للعودة): home | collection
   details: null,
   detailsLoading: false,
   seasons: [],
@@ -75,6 +81,7 @@ export const store = reactive({
   activeCollection: null, // {kind:'favorites'|'recents'|'user'|'row', key?, name}
   collectionItems: [],
   collectionLoading: false,
+  collectionError: '',
   rowSort: 'rating', // فرز صفحات "المزيد": rating | latest
 
   // ---------- عام ----------
@@ -86,7 +93,7 @@ export const store = reactive({
 
   // ---------- حجم بطاقات البوسترات (إعداد محلي) ----------
   // sm/md/lg/xl — يضبط متغير CSS عام --card-w فتعاد شبكة العرض كلها.
-  cardSize: localStorage.getItem('cinemana_card_size') || 'md',
+  cardSize: loadCardSize(),
 })
 
 // CARD_SIZES خيارات حجم البطاقة بالبكسل (عرض البوستر).
@@ -106,9 +113,34 @@ export function applyCardSizeVar() {
 
 // setCardSize تغيير الحجم وحفظه محلياً.
 export function setCardSize(key) {
+  if (!CARD_SIZES.some((s) => s.key === key)) return
   store.cardSize = key
-  localStorage.setItem('cinemana_card_size', key)
+  safeSet('cinemana_card_size', key)
   applyCardSizeVar()
+}
+
+// loadCardSize يقرأ الحجم المحفوظ ويتحقق منه (قيمة تالفة = المتوسط).
+function loadCardSize() {
+  const v = safeGet('cinemana_card_size')
+  return ['sm', 'md', 'lg', 'xl'].includes(v) ? v : 'md'
+}
+
+// أرقام تسلسلية لطلبات كل مورد: الاستجابة المتأخرة لطلب قديم تُهمل بدل أن
+// تطغى على نتيجة أحدث (أو تعيد إحياء شاشة أُغلقت).
+const seq = { search: 0, details: 0, playback: 0, browse: 0, collection: 0, episodes: 0 }
+
+// حجم صفحة التصفح/البحث كما يعيدها الباك-اند (desktop/app.go: Browse تقص إلى 30).
+const PAGE_SIZE = 30
+
+// errMsg استخراج رسالة نصية من أي خطأ.
+function errMsg(err) {
+  return typeof err === 'string' ? err : err?.message || String(err)
+}
+
+// mergeById يضيف عناصر جديدة إلى قائمة دون تكرار المعرّفات (مفاتيح v-for فريدة).
+function mergeById(base, extra) {
+  const seen = new Set(base.map((x) => x.id))
+  return [...base, ...extra.filter((x) => !seen.has(x.id))]
 }
 
 // =============================================================================
@@ -132,6 +164,7 @@ export function onQueryInput(value) {
 // clearSearch إلغاء البحث والعودة لصفحة الاستكشاف (Top + الصفوف).
 export function clearSearch() {
   clearTimeout(searchTimer)
+  seq.search++ // يلغي أي بحث جارٍ فلا يعيد ملء النتائج بعد المسح
   store.query = ''
   store.results = []
   store.searched = false
@@ -141,44 +174,35 @@ export function clearSearch() {
 }
 
 function fail(err) {
-  store.error = typeof err === 'string' ? err : err?.message || String(err)
+  store.error = errMsg(err)
 }
 
 // تحويل ثوانٍ إلى مدة مقروءة: "1 س 47 د" أو "55 د".
 export function fmtDuration(sec) {
   const n = Math.round(parseFloat(sec) || 0)
   if (n <= 0) return ''
-  const h = Math.floor(n / 3600)
-  const m = Math.round((n % 3600) / 60)
+  const total = Math.round(n / 60) // نقرّب الدقائق الكلية أولاً: 3599ث = 60د لا "0س 60د"
+  const h = Math.floor(total / 60)
+  const m = total % 60
   return h > 0 ? `${h} س ${String(m).padStart(2, '0')} د` : `${m} د`
 }
 
 function loadRecents() {
   try {
-    return JSON.parse(localStorage.getItem(RECENT_KEY) || '[]')
+    return normalizeCards(JSON.parse(safeGet(RECENT_KEY) || 'null'), 12)
   } catch {
     return []
   }
 }
 
+// pushRecent لا يرمي أبداً: فشل التخزين يجب ألا يوقف فتح التفاصيل.
 function pushRecent(item) {
-  const entry = pickCardFields(item)
-  store.recents = [entry, ...store.recents.filter((r) => r.id !== entry.id)].slice(0, 12)
-  localStorage.setItem(RECENT_KEY, JSON.stringify(store.recents))
-}
-
-// pickCardFields يستخرج الحقول الدنيا التي تحتاجها بطاقة البوستر/القوائم.
-function pickCardFields(item) {
-  return {
-    id: String(item.id),
-    ar_title: item.ar_title || '',
-    en_title: item.en_title || '',
-    type: item.type || 'movie',
-    year: item.year || '',
-    rating: item.rating || '',
-    poster_url: item.poster_url || '',
-    thumbnail_url: item.thumbnail_url || '',
-    categories: item.categories || [],
+  try {
+    const entry = pickCardFields(item)
+    store.recents = [entry, ...store.recents.filter((r) => r.id !== entry.id)].slice(0, 12)
+    safeSet(RECENT_KEY, JSON.stringify(store.recents))
+  } catch {
+    /* المشاهدات الأخيرة ميزة ثانوية */
   }
 }
 
@@ -187,34 +211,41 @@ function pickCardFields(item) {
 // =============================================================================
 
 export async function doSearch(reset = true) {
+  clearTimeout(searchTimer) // الضغط على Enter لا يترك مؤقت الكتابة يطلق طلباً مكرراً
   const q = store.query.trim()
   if (!q) {
+    seq.search++
     store.results = []
     store.searched = false
     store.hasMore = false
     return
   }
+  const my = ++seq.search
+  const type = store.type
+  store.view = 'home' // نتائج البحث تظهر في الرئيسية مهما كانت الشاشة الحالية
   store.loading = true
   store.error = ''
   store.browse.active = false // البحث له الأولوية على نتائج التصفح
   try {
     const page = reset ? 1 : store.page + 1
-    const items = await api.search(q, store.type, page)
-    store.results = reset ? items : [...store.results, ...items]
+    const items = await api.search(q, type, page)
+    if (my !== seq.search) return // استجابة قديمة
+    store.results = reset ? items : mergeById(store.results, items)
     store.page = page
     store.searched = true
     // الخدمة ترجع صفحات كاملة عادة؛ الصفحة الفارغة تعني نهاية النتائج.
     store.hasMore = items.length > 0
   } catch (e) {
-    fail(e)
+    if (my === seq.search) fail(e)
   } finally {
-    store.loading = false
+    if (my === seq.search) store.loading = false
   }
 }
 
 export function setType(t) {
   if (store.type === t) return
   store.type = t
+  seq.search++ // أي بحث جارٍ بالنوع القديم يُهمل
   if (store.query.trim()) doSearch(true)
 }
 
@@ -253,7 +284,7 @@ export async function ensureRow(key) {
     store.rows[key].items = await api.collection(key, 14)
     store.rows[key].loaded = true
   } catch (e) {
-    store.rows[key].error = typeof e === 'string' ? e : e?.message || String(e)
+    store.rows[key].error = errMsg(e)
   } finally {
     store.rows[key].loading = false
   }
@@ -269,8 +300,10 @@ export async function ensureTop(tabKey) {
     store.top[tabKey].items = await api.collection(tabKey, 12)
     store.top[tabKey].loaded = true
   } catch (e) {
+    // loaded تبقى false: النقر على التبويب مجدداً يعيد المحاولة (دون حلقة
+    // جلب تلقائية لأن الاستدعاء يأتي من حدث المستخدم فقط).
+    store.top[tabKey].error = errMsg(e)
     fail(e)
-    store.top[tabKey].loaded = true // لا نعيد الجلب اللانهائي عند الخطأ
   } finally {
     store.top[tabKey].loading = false
   }
@@ -286,33 +319,45 @@ export function setTopTab(tabKey) {
 // =============================================================================
 
 // ensureCategories يجلب تصنيفات الخدمة مرة واحدة (للقائمة المنسدلة).
+let categoriesPromise = null
 export async function ensureCategories() {
   if (store.categories.length) return
-  try {
-    store.categories = await api.categories()
-  } catch (e) {
-    fail(e)
+  if (!categoriesPromise) {
+    categoriesPromise = api
+      .categories()
+      .then((c) => {
+        store.categories = Array.isArray(c) ? c : []
+      })
+      .catch(fail)
+      .finally(() => {
+        categoriesPromise = null
+      })
   }
+  await categoriesPromise
 }
 
 // applyFilters ينفذ التصفح بالفلاتر الحالية ويعرض الشبكة في الرئيسية.
 export async function applyFilters(filters, reset = true) {
+  clearTimeout(searchTimer) // مؤقت بحث معلّق كان سيطغى على نتائج الفلترة
+  const my = ++seq.browse
   const page = reset ? 1 : store.browse.page + 1
+  store.view = 'home'
   store.browse.active = true
   store.browse.loading = true
   store.browse.filters = filters
-  store.browse.page = page
   try {
     const items = await api.browse({ ...filters, page })
-    store.browse.items = reset ? items : [...store.browse.items, ...items]
-    store.browse.hasMore = items.length >= 30 // الصفحة ممتلئة غالباً = يوجد المزيد
+    if (my !== seq.browse) return // استجابة قديمة أو أُلغي التصفح
+    store.browse.items = reset ? items : mergeById(store.browse.items, items)
+    store.browse.page = page // يتقدم العدّاد عند النجاح فقط (الفشل لا يتخطى صفحة)
+    store.browse.hasMore = items.length >= PAGE_SIZE // الصفحة ممتلئة غالباً = يوجد المزيد
     store.browse.title = browseTitle(filters)
     store.searched = false
     store.results = []
   } catch (e) {
-    fail(e)
+    if (my === seq.browse) fail(e)
   } finally {
-    store.browse.loading = false
+    if (my === seq.browse) store.browse.loading = false
   }
 }
 
@@ -342,6 +387,7 @@ export function moreBrowse() {
 
 // clearBrowse إنهاء وضع التصفح والعودة للاستكشاف (Top + الصفوف).
 export function clearBrowse() {
+  seq.browse++
   store.browse = { active: false, title: '', filters: null, items: [], loading: false, page: 1, hasMore: false }
 }
 
@@ -350,7 +396,26 @@ export function clearBrowse() {
 // =============================================================================
 
 export function isFavorite(id) {
-  return store.favorites.some((f) => f.id === String(id))
+  const key = String(id)
+  return store.favorites.some((f) => f.id === key)
+}
+
+// persist يحفظ ويخبر المستخدم إن فشل (الحالة في الذاكرة تبقى سليمة).
+function persist(ok) {
+  if (!ok) store.error = 'تعذر الحفظ في التخزين المحلي — ستُفقد التغييرات عند إغلاق التطبيق'
+  return ok
+}
+
+// refreshCollection يزامن القائمة المعروضة مع مصدرها بعد أي تعديل
+// (كان العرض يحتفظ بنسخة قديمة فلا يتحدث عند إزالة ♥ داخل شاشة المفضلة).
+function refreshCollection() {
+  const c = store.activeCollection
+  if (!c) return
+  if (c.kind === 'favorites') store.collectionItems = store.favorites
+  else if (c.kind === 'recents') store.collectionItems = store.recents
+  else if (c.kind === 'user') {
+    store.collectionItems = store.userLists.find((l) => l.id === c.key)?.items || []
+  }
 }
 
 export function toggleFavorite(item) {
@@ -362,21 +427,22 @@ export function toggleFavorite(item) {
     store.favorites = [card, ...store.favorites]
     store.notice = 'أُضيف إلى المفضلة'
   }
-  saveFavorites(store.favorites)
+  persist(saveFavorites(store.favorites))
+  refreshCollection()
 }
 
 export function createUserList(name) {
-  const clean = (name || '').trim()
+  const clean = (name || '').trim().slice(0, 80)
   if (!clean) return null
   const list = { id: String(Date.now()), name: clean, items: [] }
   store.userLists = [...store.userLists, list]
-  saveUserLists(store.userLists)
+  persist(saveUserLists(store.userLists))
   return list
 }
 
 export function deleteUserList(id) {
   store.userLists = store.userLists.filter((l) => l.id !== id)
-  saveUserLists(store.userLists)
+  persist(saveUserLists(store.userLists))
   // إن كنا نعرض هذه القائمة حالياً نعود للرئيسية.
   if (store.activeCollection?.kind === 'user' && store.activeCollection?.key === id) {
     closeCollection()
@@ -393,8 +459,9 @@ export function addToUserList(listId, item) {
   }
   list.items = [card, ...list.items]
   store.userLists = [...store.userLists]
-  saveUserLists(store.userLists)
+  persist(saveUserLists(store.userLists))
   store.notice = `أُضيف إلى «${list.name}»`
+  refreshCollection()
 }
 
 export function removeFromUserList(listId, itemId) {
@@ -402,11 +469,8 @@ export function removeFromUserList(listId, itemId) {
   if (!list) return
   list.items = list.items.filter((x) => x.id !== String(itemId))
   store.userLists = [...store.userLists]
-  saveUserLists(store.userLists)
-  // تحديث العرض إن كنا نتصفح هذه القائمة.
-  if (store.activeCollection?.kind === 'user' && store.activeCollection?.key === listId) {
-    store.collectionItems = list.items
-  }
+  persist(saveUserLists(store.userLists))
+  refreshCollection()
 }
 
 // =============================================================================
@@ -414,32 +478,32 @@ export function removeFromUserList(listId, itemId) {
 // =============================================================================
 
 export function openCollection(kind, key = null, name = '') {
+  seq.collection++ // يلغي أي صفحة "مزيد" جارية
   store.activeCollection = { kind, key, name }
-  if (kind === 'favorites') {
-    store.collectionItems = store.favorites
-  } else if (kind === 'recents') {
-    store.collectionItems = store.recents
-  } else {
-    const list = store.userLists.find((l) => l.id === key)
-    store.collectionItems = list ? list.items : []
-  }
+  store.collectionError = ''
+  store.collectionLoading = false
+  refreshCollection()
   store.view = 'collection'
 }
 
 // openRowPage صفحة كاملة لصنف من الصفوف (زر "المزيد" في الرئيسية):
 // تجلب دفعة كبيرة (60) من نفس مفتاح الصنف — والفرز بالتقييم متاح فيها.
 export async function openRowPage(key, title) {
+  const my = ++seq.collection
   store.activeCollection = { kind: 'row', key, name: title }
   store.rowSort = 'rating'
   store.collectionItems = []
+  store.collectionError = ''
   store.collectionLoading = true
   store.view = 'collection'
   try {
-    store.collectionItems = await api.collection(key, 60)
+    const items = await api.collection(key, 60)
+    if (my !== seq.collection) return // انتقل المستخدم لشاشة أخرى
+    store.collectionItems = items
   } catch (e) {
-    fail(e)
+    if (my === seq.collection) store.collectionError = errMsg(e)
   } finally {
-    store.collectionLoading = false
+    if (my === seq.collection) store.collectionLoading = false
   }
 }
 
@@ -450,9 +514,25 @@ export function setRowSort(sort) {
 
 // closeCollection ينهي وضع التصفح ويعود للرئيسية.
 export function closeCollection() {
+  seq.collection++
+  store.collectionLoading = false
+  store.collectionError = ''
   store.view = 'home'
   store.activeCollection = null
   store.collectionItems = []
+}
+
+// goHome العودة للرئيسية من أي شاشة (تنظف حالة القائمة والتفاصيل).
+export function goHome() {
+  closeCollection()
+  seq.details++
+  seq.playback++
+  store.currentItem = null
+  store.details = null
+  store.playback = null
+  store.detailsLoading = false
+  store.playbackLoading = false
+  store.view = 'home'
 }
 
 // =============================================================================
@@ -460,6 +540,10 @@ export function closeCollection() {
 // =============================================================================
 
 export async function openDetails(item) {
+  const my = ++seq.details
+  seq.playback++
+  seq.episodes++
+  store.detailsFrom = store.activeCollection && store.view !== 'home' ? 'collection' : 'home'
   store.currentItem = item
   store.view = 'details'
   store.details = null
@@ -470,29 +554,39 @@ export async function openDetails(item) {
   pushRecent(item)
 
   store.detailsLoading = true
+  store.seasonsLoading = false
+  store.playbackLoading = false
   try {
-    store.details = await api.details(item.id)
-    if (store.details.type === 'series') {
+    const details = await api.details(item.id)
+    if (my !== seq.details) return
+    store.details = details
+    if (details.type === 'series') {
       store.seasonsLoading = true
-      store.seasons = await api.episodes(item.id)
+      const seasons = await api.episodes(item.id)
+      if (my !== seq.details) return
+      store.seasons = seasons
       // نفتح الموسم الأول تلقائياً ليظهر المحتوى فوراً.
-      store.activeSeason = store.seasons[0]?.season ?? null
+      store.activeSeason = seasons[0]?.season ?? null
     } else {
       // الأفلام: نجلب معلومات التشغيل فوراً مع تمرير معرفات النسخ
       // المكررة — إن كانت النسخة الأساسية ميتة جُرب البديل تلقائياً.
       await preparePlayback(item.id, item.alts || [])
     }
   } catch (e) {
-    fail(e)
+    if (my === seq.details) fail(e)
   } finally {
-    store.detailsLoading = false
-    store.seasonsLoading = false
+    if (my === seq.details) {
+      store.detailsLoading = false
+      store.seasonsLoading = false
+    }
   }
 }
 
 export function closeDetails() {
-  // العودة: للقائمة إن أتينا منها، وإلا للرئيسية.
-  if (store.activeCollection && store.view === 'details') {
+  seq.details++
+  seq.playback++
+  // العودة: للقائمة التي فُتحت منها التفاصيل، وإلا للرئيسية.
+  if (store.detailsFrom === 'collection' && store.activeCollection) {
     store.view = 'collection'
   } else {
     store.view = 'home'
@@ -500,6 +594,8 @@ export function closeDetails() {
   store.currentItem = null
   store.details = null
   store.playback = null
+  store.detailsLoading = false
+  store.playbackLoading = false
 }
 
 export function selectSeason(num) {
@@ -521,19 +617,23 @@ export async function selectEpisode(ep) {
 // alts: معرفات النسخ المكررة لنفس العمل — يجرّبها الباك-اند تلقائياً
 // إذا كانت نسخة المعرف الأساسي ميتة (ملفاتها محذوفة من الخدمة).
 export async function preparePlayback(nb, alts = []) {
+  const my = ++seq.playback
   store.playback = null
   store.playbackLoading = true
   store.selectedQuality = 0
   try {
-    store.playback = await api.playback(nb, alts)
+    const pb = await api.playback(nb, alts)
+    if (my !== seq.playback) return // حلقة/عمل آخر اختير أثناء الجلب
+    const subs = Array.isArray(pb.subtitles) ? pb.subtitles : []
+    store.playback = { ...pb, subtitles: subs, qualities: pb.qualities || [] }
     // افتراضياً: أعلى جودة (القائمة مرتبة تنازلياً من الباك-اند)
     // وأول ترجمة عربية إن وُجدت.
-    const arIdx = store.playback.subtitles.findIndex((s) => s.lang_code === 'ar')
-    store.selectedSubtitle = store.playback.subtitles.length ? (arIdx >= 0 ? arIdx : 0) : -1
+    const arIdx = subs.findIndex((s) => s.lang_code === 'ar')
+    store.selectedSubtitle = subs.length ? (arIdx >= 0 ? arIdx : 0) : -1
   } catch (e) {
-    fail(e)
+    if (my === seq.playback) fail(e)
   } finally {
-    store.playbackLoading = false
+    if (my === seq.playback) store.playbackLoading = false
   }
 }
 
@@ -603,7 +703,8 @@ export function closeSettings() {
 
 export async function saveSettings(s) {
   try {
-    store.settings = await api.saveSettings(s)
+    await api.saveSettings(s) // Go تعيد خطأً فقط (لا قيمة)
+    store.settings = await api.getSettings() // القيم المطبَّعة كما حُفظت فعلاً
     store.settingsOpen = false
     store.notice = 'تم حفظ الإعدادات'
   } catch (e) {
@@ -643,33 +744,48 @@ export async function exportUserData() {
 }
 
 // importUserData يستعيد بيانات من ملف JSON مع دمجها بالحالية
-// (المستورد أولاً، وإزالة التكرار حسب المعرّف).
+// (المستورد أولاً، وإزالة التكرار حسب المعرّف). المدخلات تُطبَّع وتُقيَّد قبل
+// لمس الحالة، والقوائم ذات المعرّف نفسه تُدمج عناصرها بدل استبدالها،
+// ولا تتغير الحالة في الذاكرة إلا بعد نجاح الحفظ.
 export async function importUserData() {
+  let raw
   try {
-    const raw = await api.importUserData()
-    if (!raw) return
-    const data = JSON.parse(raw)
-    const favs = Array.isArray(data.favorites) ? data.favorites : []
-    const lists = Array.isArray(data.user_lists) ? data.user_lists : []
-    const recs = Array.isArray(data.recents) ? data.recents : []
-    if (!favs.length && !lists.length && !recs.length) {
-      store.error = 'الملف لا يحتوي بيانات صالحة للاستيراد'
-      return
-    }
-    const uniq = (arr) => {
-      const seen = new Set()
-      return arr.filter((x) => !seen.has(String(x.id)) && seen.add(String(x.id)))
-    }
-    store.favorites = uniq([...favs, ...store.favorites])
-    const byId = new Map(store.userLists.map((l) => [l.id, l]))
-    for (const l of lists) byId.set(String(l.id), { ...l, id: String(l.id), items: l.items || [] })
-    store.userLists = [...byId.values()]
-    store.recents = uniq([...recs, ...store.recents]).slice(0, 12)
-    saveFavorites(store.favorites)
-    saveUserLists(store.userLists)
-    localStorage.setItem(RECENT_KEY, JSON.stringify(store.recents))
-    store.notice = `تم الاستيراد: ${favs.length} مفضلة و${lists.length} قائمة`
+    raw = await api.importUserData()
   } catch (e) {
-    store.error = 'فشل الاستيراد: الملف غير صالح — ' + (typeof e === 'string' ? e : e?.message || e)
+    fail(e)
+    return
   }
+  if (!raw) return
+  let data
+  try {
+    data = JSON.parse(raw)
+  } catch (e) {
+    store.error = 'فشل الاستيراد: الملف ليس JSON صالحاً'
+    return
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    store.error = 'فشل الاستيراد: بنية الملف غير معروفة'
+    return
+  }
+  const favs = normalizeCards(data.favorites)
+  const lists = normalizeLists(data.user_lists)
+  const recs = normalizeCards(data.recents, 12)
+  if (!favs.length && !lists.length && !recs.length) {
+    store.error = 'الملف لا يحتوي بيانات صالحة للاستيراد'
+    return
+  }
+  const nextFavs = normalizeCards([...favs, ...store.favorites])
+  const nextLists = normalizeLists([...store.userLists, ...lists])
+  const nextRecs = normalizeCards([...recs, ...store.recents], 12)
+
+  const ok =
+    saveFavorites(nextFavs) &&
+    saveUserLists(nextLists) &&
+    safeSet(RECENT_KEY, JSON.stringify(nextRecs))
+  store.favorites = nextFavs
+  store.userLists = nextLists
+  store.recents = nextRecs
+  refreshCollection()
+  if (!persist(ok)) return
+  store.notice = `تم الاستيراد: ${favs.length} مفضلة و${lists.length} قائمة`
 }

@@ -3,30 +3,54 @@
 // ErrorToast.vue — تنبيه عائم سفلي يعرض أخطاء الشبكة/الخدمة (store.error)
 // ورسائل النجاح العابرة (store.notice) ويخفي نفسه تلقائياً.
 // =============================================================================
-import { ref, watch } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { store, dismissError } from '../store.js'
 
 const visible = ref(false)
 const isNotice = ref(false)
-let timer = null
+let errTimer = null
+let noticeTimer = null
+
+// الخطأ له الأولوية على الرسالة العابرة. لكل قناة مؤقتها الخاص حتى لا يلغي
+// وصول خطأ مؤقت الرسالة (فتعاود الظهور بعد إغلاق الخطأ)، ويُعاد ضبط المؤقت
+// حتى لو تكررت الرسالة نفسها (watch على النص وحده لا يلتقط التكرار).
+function sync() {
+  if (store.error) {
+    isNotice.value = false
+    visible.value = true
+  } else if (store.notice) {
+    isNotice.value = true
+    visible.value = true
+  } else {
+    visible.value = false
+  }
+}
 
 watch(
-  () => [store.error, store.notice],
-  ([err, notice]) => {
-    clearTimeout(timer)
+  () => store.error,
+  (err) => {
+    clearTimeout(errTimer)
     if (err) {
-      isNotice.value = false
-      visible.value = true
-      timer = setTimeout(() => dismissError(), 8000) // الأخطاء تبقى أطول
-    } else if (notice) {
-      isNotice.value = true
-      visible.value = true
-      timer = setTimeout(() => (store.notice = ''), 3000)
-    } else {
-      visible.value = false
+      store.notice = '' // لا رسالة قديمة تظهر بعد إغلاق الخطأ
+      errTimer = setTimeout(() => dismissError(), 8000) // الأخطاء تبقى أطول
     }
+    sync()
   },
 )
+
+watch(
+  () => store.notice,
+  (notice) => {
+    clearTimeout(noticeTimer)
+    if (notice) noticeTimer = setTimeout(() => (store.notice = ''), 3000)
+    sync()
+  },
+)
+
+onBeforeUnmount(() => {
+  clearTimeout(errTimer)
+  clearTimeout(noticeTimer)
+})
 </script>
 
 <template>

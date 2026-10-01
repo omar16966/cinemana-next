@@ -11,6 +11,7 @@ import {
   deleteUserList,
   removeFromUserList,
   setRowSort,
+  openRowPage,
 } from '../store.js'
 import PosterCard from './PosterCard.vue'
 import SkeletonCard from './SkeletonCard.vue'
@@ -98,6 +99,17 @@ const sortedItems = computed(() => {
           </svg>
         </button>
       </div>
+    </div>
+
+    <div v-else-if="store.collectionError" class="py-20 text-center text-zinc-400">
+      <p class="text-lg">تعذر تحميل القائمة</p>
+      <p class="mt-2 text-sm text-zinc-500">{{ store.collectionError }}</p>
+      <button
+        @click="openRowPage(store.activeCollection.key, store.activeCollection.name)"
+        class="mt-4 rounded-lg bg-accent-500 px-5 py-2 text-sm font-bold text-white transition hover:bg-accent-400"
+      >
+        إعادة المحاولة
+      </button>
     </div>
 
     <div v-else class="py-20 text-center text-zinc-500">

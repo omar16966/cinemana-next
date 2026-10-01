@@ -19,8 +19,9 @@
 //   حفظ موضع المشاهدة: كل 5 ثوانٍ في localStorage بمفتاح معرف العمل،
 //   ويُستأنف تلقائياً عند العودة (زر "من البداية" يمسحه).
 // =============================================================================
-import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, shallowRef, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { store, closePlayer, playMpv } from '../store.js'
+import { safeGet, safeSet } from '../services/lists.js'
 
 const videoEl = ref(null)
 const buffering = ref(true)
@@ -28,25 +29,36 @@ const videoError = ref('')
 const ccOn = ref(true)
 const stylePanelOpen = ref(false)
 const resumedAt = ref(0)
-const cues = ref([])
+// المقاطع مرتبة زمنياً وغير قابلة للتعديل: shallowRef يتجنب تحويل آلاف الكائنات لـ reactive.
+const cues = shallowRef([])
 const activeCue = ref(null)
 let hls = null
 let rafId = 0
 let lastSavedT = -1
+let resumeTimer = 0
+let setupGen = 0 // رقم دورة setup: يبطل عمليات async المتأخرة بعد التفكيك/إعادة المحاولة
 
 // =============================================================================
 // إعدادات تنسيق الترجمة — تُطبق على طبقة العرض مباشرة (بكسل حقيقي)
 // =============================================================================
 const SUB_STYLE_KEY = 'cinemana_substyle_v2'
 
+const SUB_DEFAULTS = { font: 'inherit', size: 30, color: '#ffffff', bg: '#000000', bgOpacity: 45 }
+const clampNum = (v, lo, hi, def) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : def)
+
+// القيم المحفوظة غير موثوقة (تخزين قد يكون تالفاً): نتحقق من كل حقل.
 function loadSubStyle() {
+  let saved = {}
   try {
-    return Object.assign(
-      { font: 'inherit', size: 30, color: '#ffffff', bg: '#000000', bgOpacity: 45 },
-      JSON.parse(localStorage.getItem(SUB_STYLE_KEY) || '{}'),
-    )
-  } catch {
-    return { font: 'inherit', size: 30, color: '#ffffff', bg: '#000000', bgOpacity: 45 }
+    saved = JSON.parse(safeGet(SUB_STYLE_KEY) || '{}') || {}
+  } catch { /* افتراضيات */ }
+  const hex = /^#[0-9a-f]{6}$/i
+  return {
+    font: typeof saved.font === 'string' ? saved.font : SUB_DEFAULTS.font,
+    size: clampNum(Number(saved.size), 12, 80, SUB_DEFAULTS.size),
+    color: hex.test(saved.color) ? saved.color : SUB_DEFAULTS.color,
+    bg: hex.test(saved.bg) ? saved.bg : SUB_DEFAULTS.bg,
+    bgOpacity: clampNum(Number(saved.bgOpacity), 0, 100, SUB_DEFAULTS.bgOpacity),
   }
 }
 
@@ -54,7 +66,7 @@ const subStyle = reactive(loadSubStyle())
 
 // حفظ تلقائي عند أي تعديل (بسيط وفعال).
 function persistSubStyle() {
-  localStorage.setItem(SUB_STYLE_KEY, JSON.stringify({ ...subStyle }))
+  safeSet(SUB_STYLE_KEY, JSON.stringify({ ...subStyle }))
 }
 
 // hexToRgba تحويل لون hex + شفافية إلى rgba (للخلفية).
@@ -106,43 +118,81 @@ function toSec(s) {
   return hr * 3600 + min * 60 + sec
 }
 
-// parseVTT محلل مبسط لك blocks VTT التي تنتجها طبقة Go (موحدة التنسيق).
+// stripCueMarkup يزيل وسوم VTT (<i>، <c.color>، <00:01.000>) ويفك كيانات HTML
+// الشائعة — النص يُعرض كنص عادي (لا v-html) فلا خطر حقن، لكن الوسوم قبيحة.
+function stripCueMarkup(t) {
+  return t
+    .replace(/<[^>]*>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+}
+
+// parseVTT محلل مبسط لكتل VTT التي تنتجها طبقة Go (موحدة التنسيق).
 function parseVTT(text) {
   const out = []
-  for (const block of text.replace(/\r/g, '').split('\n\n')) {
+  for (const block of text.replace(/\r/g, '').split(/\n\s*\n/)) {
     const lines = block.split('\n')
     const ti = lines.findIndex((l) => l.includes('-->'))
     if (ti === -1) continue
     const [a, b] = lines[ti].split('-->')
     const start = toSec(a)
     const end = toSec((b || '').trim().split(/\s+/)[0])
-    const body = lines
-      .slice(ti + 1)
-      .join('\n')
-      .replace(/\{\\[^}]*\}/g, '') // وسوم ASS إن تسربت
-      .trim()
+    const body = stripCueMarkup(
+      lines
+        .slice(ti + 1)
+        .join('\n')
+        .replace(/\{\\[^}]*\}/g, ''), // وسوم ASS إن تسربت
+    ).trim()
     if (body && end > start) out.push({ start, end, text: body })
   }
+  out.sort((x, y) => x.start - y.start) // شرط البحث الثنائي
   return out
 }
 
+// findCue بحث ثنائي عن المقطع النشط عند الزمن t (بدل مسح خطي كل إطار).
+function findCue(list, t) {
+  let lo = 0
+  let hi = list.length - 1
+  let cand = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1
+    if (list[mid].start <= t) {
+      cand = mid
+      lo = mid + 1
+    } else hi = mid - 1
+  }
+  // المقاطع قد تتداخل: نرجع قليلاً بحثاً عن مقطع لم ينتهِ بعد.
+  for (let i = cand; i >= 0 && i > cand - 5; i--) {
+    if (t <= list[i].end) return list[i]
+  }
+  return null
+}
+
 // attachSubtitle يجلب نص الترجمة عبر الوكيل ويحلله إلى المقاطع.
-async function attachSubtitle() {
+const subtitleFailed = ref(false)
+async function attachSubtitle(gen) {
   cues.value = []
   activeCue.value = null
+  subtitleFailed.value = false
   const sub = store.player?.sub
   if (!sub) return
   try {
     const res = await fetch(sub)
+    if (gen !== setupGen) return // أُغلق المشغل أو أُعيدت المحاولة أثناء الجلب
     if (res.ok) {
       const text = await res.text()
+      if (gen !== setupGen) return
       if (text.trim().startsWith('WEBVTT')) {
         cues.value = parseVTT(text)
         return
       }
     }
+    subtitleFailed.value = true
   } catch {
     // بلا ترجمة عند الفشل — لا نص احتياطي لتفادي مسار <track> القديم.
+    if (gen === setupGen) subtitleFailed.value = true
   }
 }
 
@@ -151,13 +201,17 @@ function toggleCC() {
   ccOn.value = !ccOn.value
 }
 
-// حلقة المزامنة: تختار المقطع النشط من currentTime كل إطار.
+// updateCue يختار المقطع النشط من currentTime (بحث ثنائي رخيص).
+function updateCue() {
+  const v = videoEl.value
+  if (v && cues.value.length) activeCue.value = findCue(cues.value, v.currentTime)
+}
+
+// حلقة المزامنة: تعمل فقط أثناء التشغيل (حركة سلسة)؛ عند الإيقاف/القفز
+// يكفي حدث seeked/timeupdate فلا نستهلك CPU لإطارات بلا تغيير.
 function tick() {
   const v = videoEl.value
-  if (v && cues.value.length) {
-    const t = v.currentTime
-    activeCue.value = cues.value.find((c) => t >= c.start && t <= c.end) || null
-  }
+  if (v && !v.paused) updateCue()
   rafId = requestAnimationFrame(tick)
 }
 
@@ -174,11 +228,12 @@ function onTimeUpdate() {
   const v = videoEl.value
   if (!v || !v.duration || isNaN(v.duration)) return
   const t = Math.floor(v.currentTime)
-  if (t - lastSavedT >= 5) {
+  updateCue()
+  // abs: بعد الرجوع للخلف أو "من البداية" يجب أن يستمر الحفظ (كان يتوقف
+  // حتى يتجاوز التشغيل أقصى موضع سابق).
+  if (Math.abs(t - lastSavedT) >= 5) {
     lastSavedT = t
-    try {
-      localStorage.setItem(posKey(), JSON.stringify({ t, d: Math.floor(v.duration), ts: Date.now() }))
-    } catch { /* التخزين ممتلئ — نتجاهل */ }
+    safeSet(posKey(), JSON.stringify({ t, d: Math.floor(v.duration), ts: Date.now() }))
   }
 }
 
@@ -187,11 +242,12 @@ function resumeIfSaved() {
   const v = videoEl.value
   if (!v) return
   try {
-    const saved = JSON.parse(localStorage.getItem(posKey()) || 'null')
-    if (saved && saved.t > 20 && v.duration && saved.t < v.duration * 0.95) {
+    const saved = JSON.parse(safeGet(posKey()) || 'null')
+    if (saved && Number.isFinite(saved.t) && saved.t > 20 && v.duration && saved.t < v.duration * 0.95) {
       v.currentTime = saved.t
       resumedAt.value = saved.t
-      setTimeout(() => (resumedAt.value = 0), 6000)
+      clearTimeout(resumeTimer)
+      resumeTimer = setTimeout(() => (resumedAt.value = 0), 6000)
     }
   } catch { /* لا موضع محفوظ */ }
 }
@@ -204,6 +260,7 @@ function restart() {
     v.play().catch(() => {})
   }
   resumedAt.value = 0
+  lastSavedT = -1
   try { localStorage.removeItem(posKey()) } catch {}
 }
 
@@ -214,8 +271,7 @@ function fmt(t) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`
 }
 
-function onVideoError(e) {
-  if (e?.target?.tagName === 'TRACK') return
+function onVideoError() {
   if (videoEl.value?.src || hls) videoError.value = 'تعذر تشغيل الفيديو — قد تكون الروابط منتهية الصلاحية'
 }
 
@@ -232,6 +288,7 @@ function onKey(e) {
 // =============================================================================
 
 async function setup() {
+  const gen = ++setupGen
   buffering.value = true
   videoError.value = ''
   resumedAt.value = 0
@@ -244,24 +301,31 @@ async function setup() {
   if (isM3u8 && !nativeHls) {
     try {
       const { default: Hls } = await import('hls.js')
+      // فُكّك المكوّن (أو أُعيدت setup) أثناء تحميل المكتبة: لا ننشئ نسخة يتيمة.
+      if (gen !== setupGen || !videoEl.value) return
       if (Hls.isSupported()) {
-        hls = new Hls()
-        hls.loadSource(src)
-        hls.attachMedia(videoEl.value)
-        hls.on(Hls.Events.ERROR, (_, data) => {
-          if (data.fatal) videoError.value = 'تعذر تشغيل بث HLS: ' + data.details
+        const h = new Hls()
+        hls = h
+        h.loadSource(src)
+        h.attachMedia(videoEl.value)
+        h.on(Hls.Events.ERROR, (_, data) => {
+          if (!data.fatal) return
+          // أخطاء الشبكة/الوسائط القابلة للتعافي: نحاول قبل الاستسلام.
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) return h.startLoad()
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) return h.recoverMediaError()
+          videoError.value = 'تعذر تشغيل بث HLS: ' + data.details
         })
-        await attachSubtitle()
+        await attachSubtitle(gen)
         return
       }
     } catch {
-      videoError.value = 'فشل تحميل مكتبة HLS'
+      if (gen === setupGen) videoError.value = 'فشل تحميل مكتبة HLS'
       return
     }
   }
   videoEl.value.src = src
   videoEl.value.play().catch(() => {})
-  await attachSubtitle()
+  await attachSubtitle(gen)
 }
 
 function destroyHls() {
@@ -277,9 +341,18 @@ onMounted(() => {
   window.addEventListener('keydown', onKey)
 })
 onBeforeUnmount(() => {
+  setupGen++ // يبطل أي setup/جلب ترجمة ما زال معلقاً
   window.removeEventListener('keydown', onKey)
   cancelAnimationFrame(rafId)
+  clearTimeout(resumeTimer)
   destroyHls()
+  // إيقاف التحميل فعلياً: إزالة العنصر وحدها لا تضمن قطع اتصال الوسائط.
+  const v = videoEl.value
+  if (v) {
+    v.pause()
+    v.removeAttribute('src')
+    v.load()
+  }
   persistSubStyle()
 })
 
@@ -348,6 +421,7 @@ const qualityLabel = computed(() => store.player?.label || '')
       autoplay
       playsinline
       @timeupdate="onTimeUpdate"
+      @seeked="updateCue"
       @loadedmetadata="resumeIfSaved"
       @ended="onEnded"
       @waiting="buffering = true"
