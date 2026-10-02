@@ -446,7 +446,21 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 		Subtitles: make([]SubtitleOut, 0, len(subs)),
 		HLS:       out.HLS,
 	}
+	// استعلام (توقيع) أول قائمة HLS رئيسية: تلميح احتياطي لروابط مستوياتها الفرعية.
+	masterQuery := ""
 	for _, q := range out.Qualities {
+		if q.Kind == "hls" {
+			if u, err := url.Parse(q.URL); err == nil {
+				masterQuery = u.RawQuery
+			}
+			break
+		}
+	}
+	for _, q := range out.Qualities {
+		local := streamer.StreamURL(q.URL)
+		if q.Kind == "hls-variant" {
+			local = streamer.StreamURLHint(q.URL, masterQuery)
+		}
 		pi.Qualities = append(pi.Qualities, QualityOut{
 			Resolution: q.Resolution,
 			Kind:       q.Kind,
@@ -454,7 +468,7 @@ func (a *App) buildPlayback(nb string) (*PlaybackInfo, error) {
 			Height:     q.Height,
 			Bandwidth:  q.Bandwidth,
 			Codecs:     q.Codecs,
-			LocalURL:   streamer.StreamURL(q.URL),
+			LocalURL:   local,
 			RemoteURL:  q.URL,
 		})
 	}

@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,3 +230,72 @@ func mustOpen(t *testing.T, p string) io.Reader {
 	t.Cleanup(func() { f.Close() })
 	return f
 }
+
+// TestHLSChildSignatureFallback الروابط الفرعية غير الموقّعة: يرفضها الـ CDN
+// بـ 403 فيعيد الوكيل المحاولة مرة واحدة بمعاملات توقيع القائمة الأب.
+func TestHLSChildSignatureFallback(t *testing.T) {
+	var childNoSig, childSig int
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/master.m3u8"):
+			if r.URL.Query().Get("sig") != "abc" {
+				http.Error(w, "no", http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			w.Write([]byte("#EXTM3U\n#EXTINF:5,\nseg1.ts\n"))
+		case strings.HasSuffix(r.URL.Path, "/seg1.ts"):
+			if r.URL.Query().Get("sig") != "abc" {
+				childNoSig++
+				http.Error(w, "forbidden", http.StatusForbidden)
+				return
+			}
+			childSig++
+			w.Write([]byte("SEGMENT"))
+		}
+	}))
+	defer up.Close()
+	s := newTestStreamer(t, up.URL)
+
+	resp := get(t, "GET", s.StreamURL(up.URL+"/master.m3u8?sig=abc"), "")
+	b, _ := io.ReadAll(resp.Body)
+	pl := string(b)
+	// رابط المقطع في القائمة المعاد كتابتها يحمل تلميح التوقيع.
+	var child string
+	for _, line := range strings.Split(pl, "\n") {
+		if strings.HasPrefix(line, s.baseURL+"/stream?u=") {
+			child = line
+		}
+	}
+	if child == "" || !strings.Contains(child, "&q=") {
+		t.Fatalf("الرابط الفرعي بلا تلميح: %q", pl)
+	}
+	resp = get(t, "GET", child, "")
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || string(body) != "SEGMENT" || childNoSig != 1 || childSig != 1 {
+		t.Errorf("الخطة البديلة: status=%d body=%q noSig=%d sig=%d", resp.StatusCode, body, childNoSig, childSig)
+	}
+
+	// بلا تلميح: يبقى الرفض كما هو (لا إلحاق افتراضي).
+	plain := s.StreamURL(up.URL + "/seg1.ts")
+	if resp = get(t, "GET", plain, ""); resp.StatusCode != http.StatusForbidden {
+		t.Errorf("بلا تلميح يجب أن يمر الرفض كما هو: %d", resp.StatusCode)
+	}
+}
+
+func TestDecodeHint(t *testing.T) {
+	enc := func(s string) string { return strings.TrimRight(base64URL(s), "=") }
+	if decodeHint(enc("Expires=1&Signature=a%2Bb")) == "" {
+		t.Error("استعلام سليم يجب أن يُقبل")
+	}
+	for _, bad := range []string{"a b", "a#b", "a\nb", "%zz=1;"} {
+		if decodeHint(enc(bad)) != "" {
+			t.Errorf("decodeHint(%q) يجب أن يرفض", bad)
+		}
+	}
+	if decodeHint("!!!") != "" || decodeHint("") != "" {
+		t.Error("مدخل غير base64/فارغ يجب أن يُرفض")
+	}
+}
+
+func base64URL(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }

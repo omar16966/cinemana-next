@@ -4,7 +4,7 @@
 //   - المفضلة / المشاهدات الأخيرة / قائمة خاصة بالمستخدم.
 //   - صفحات "المزيد" (kind='row'): شبكة كبيرة مع فرز بالتقييم أو الأحدث.
 // =============================================================================
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   store,
   closeCollection,
@@ -20,6 +20,11 @@ const isUserList = computed(() => store.activeCollection?.kind === 'user')
 const isRowPage = computed(() => store.activeCollection?.kind === 'row')
 
 // الفرز: صفحات "المزيد" تتيح الأعلى تقييماً أو الأحدث (ترتيب الخدمة).
+// عرض القوائم الكبيرة (مفضلة بالآلاف مثلاً) على دفعات بدل إنشاء كل البطاقات معاً.
+const CHUNK = 120
+const shown = ref(CHUNK)
+watch(() => [store.activeCollection?.kind, store.activeCollection?.key], () => { shown.value = CHUNK })
+
 const sortedItems = computed(() => {
   const items = store.collectionItems
   if (isRowPage.value && store.rowSort === 'rating') {
@@ -81,11 +86,11 @@ const sortedItems = computed(() => {
       <SkeletonCard v-for="i in 12" :key="'csk' + i" />
     </div>
 
+    <template v-else-if="sortedItems.length">
     <div
-      v-else-if="sortedItems.length"
       class="grid gap-3 md:gap-4 grid-cols-[repeat(auto-fill,minmax(var(--card-w),1fr))]"
     >
-      <div v-for="item in sortedItems" :key="item.id" class="relative">
+      <div v-for="item in sortedItems.slice(0, shown)" :key="item.id" class="relative">
         <PosterCard :item="item" />
         <!-- إزالة من قائمة مستخدم -->
         <button
@@ -100,6 +105,16 @@ const sortedItems = computed(() => {
         </button>
       </div>
     </div>
+
+    <div v-if="sortedItems.length > shown" class="mt-6 text-center">
+      <button
+        @click="shown += CHUNK"
+        class="rounded-full border border-white/10 bg-ink-800 px-8 py-2.5 text-sm font-semibold text-zinc-200 transition hover:border-accent-500/50"
+      >
+        عرض المزيد ({{ sortedItems.length - shown }})
+      </button>
+    </div>
+    </template>
 
     <div v-else-if="store.collectionError" class="py-20 text-center text-zinc-400">
       <p class="text-lg">تعذر تحميل القائمة</p>

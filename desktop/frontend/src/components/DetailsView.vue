@@ -13,7 +13,7 @@
 // بهذا يبقى زر التشغيل واختيار الدقة ظاهرين دائماً مهما كان عدد الحلقات
 // (كان القسم مدفوناً أسفل قائمة الحلقات الطويلة).
 // =============================================================================
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import {
   store,
   closeDetails,
@@ -30,6 +30,14 @@ import {
 } from '../store.js'
 
 const details = computed(() => store.details)
+
+// عرض الحلقات على دفعات: مسلسلات بمئات الحلقات كانت تنشئ مئات العناصر دفعة واحدة.
+const EP_CHUNK = 60
+const epLimit = ref(EP_CHUNK)
+watch(
+  () => [store.activeSeason, store.details?.id],
+  () => { epLimit.value = EP_CHUNK },
+)
 const isSeries = computed(() => details.value?.type === 'series')
 
 // نص رأس شريط التشغيل: اسم الحلقة إن كنا في مسلسل.
@@ -352,7 +360,7 @@ function createAndAdd() {
               class="overflow-hidden rounded-xl border border-white/5"
             >
               <button
-                v-for="ep in s.episodes"
+                v-for="ep in s.episodes.slice(0, epLimit)"
                 :key="ep.id"
                 @click="selectEpisode(ep)"
                 class="flex w-full items-center gap-4 border-b border-white/5 bg-ink-900 px-4 py-3 text-start transition last:border-0 hover:bg-ink-800"
@@ -373,6 +381,13 @@ function createAndAdd() {
                   viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-accent-500" fill="currentColor">
                   <path d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17Z" />
                 </svg>
+              </button>
+              <button
+                v-if="s.episodes.length > epLimit"
+                @click="epLimit += EP_CHUNK"
+                class="w-full bg-ink-900 px-4 py-3 text-center text-sm font-semibold text-accent-400 transition hover:bg-ink-800"
+              >
+                عرض المزيد ({{ s.episodes.length - epLimit }} حلقة متبقية)
               </button>
             </div>
           </div>

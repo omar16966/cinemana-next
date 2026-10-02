@@ -76,3 +76,29 @@ jobs:
       # ثغرات الاعتماديات التي تدخل الحزمة النهائية فقط (ليس أدوات التطوير).
       - name: npm audit (production)
         run: npm audit --omit=dev --audit-level=high
+
+  e2e:
+    name: Frontend e2e (Chromium + CSP)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - run: npm ci --no-audit --no-fund
+
+      # البناء النهائي (يحقن CSP) ثم اختبار الواجهة في متصفح حقيقي.
+      - run: npm run build
+
+      - name: Install Chromium
+        run: npx playwright-core install --with-deps chromium
+
+      - name: e2e
+        run: npm run test:e2e
