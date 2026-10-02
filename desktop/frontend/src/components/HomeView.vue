@@ -5,16 +5,44 @@
 //     الأجنبية/العربية/الأنمي...) — تُجلب الصفوف كسولاً عند اقتراب ظهورها.
 //   - أثناء البحث: شبكة نتائج البحث كما كانت.
 // =============================================================================
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { store, loadMore, moreBrowse, clearBrowse, HOME_ROWS } from '../store.js'
 import PosterCard from './PosterCard.vue'
 import SkeletonCard from './SkeletonCard.vue'
 import TopSection from './TopSection.vue'
 import CollectionRow from './CollectionRow.vue'
+
+// موضع التمرير يُحفظ عند مغادرة الرئيسية ويُستعاد عند العودة (التفاصيل/القوائم).
+// ارتفاع المحتوى يكتمل بعد التركيب (الصفوف تُرسم تدريجياً) فيقصّ المتصفح
+// scrollTop إن كان أكبر من الارتفاع الحالي: نعيد المحاولة عبر إطارات متتالية
+// حتى يصل الموضع أو يبدأ المستخدم بالتمرير بنفسه.
+const scroller = ref(null)
+let restoreRaf = 0
+let userScrolled = false
+function onUserScroll() { userScrolled = true }
+
+onMounted(async () => {
+  await nextTick()
+  const el = scroller.value
+  const target = store.homeScroll
+  if (!el || !target) return
+  let tries = 0
+  const step = () => {
+    if (userScrolled || !scroller.value) return
+    el.scrollTop = target
+    if (Math.abs(el.scrollTop - target) > 1 && ++tries < 60) restoreRaf = requestAnimationFrame(step)
+  }
+  step()
+})
+onBeforeUnmount(() => {
+  cancelAnimationFrame(restoreRaf)
+  if (scroller.value) store.homeScroll = scroller.value.scrollTop
+})
 </script>
 
 <template>
   <!-- التمرير الداخلي: هذا العرض يملأ ارتفاع العمود الأوسط -->
-  <div class="h-full overflow-y-auto pb-4">
+  <div ref="scroller" @wheel.passive="onUserScroll" @touchstart.passive="onUserScroll" class="h-full overflow-y-auto pb-4">
     <!-- ===== وضع البحث: شبكة النتائج ===== -->
     <template v-if="store.searched">
       <div class="mb-4 flex items-center justify-between">

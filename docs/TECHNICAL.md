@@ -18,6 +18,11 @@
 | `desktop/proxy.go` | وكيل البث المحلي: ترويسات + Range + إعادة كتابة m3u8 + SRT→VTT |
 | `desktop/settings.go` | الإعدادات المحفوظة (مسار mpv، العنوان الأساسي، UA) |
 | `desktop/frontend/src/` | واجهة Vue 3: مكونات الشبكة/التفاصيل/المشغل + طبقة `services/api.js` |
+| `desktop/frontend/src/store.js` + `store/` | الحالة المركزية: واجهة موحدة تعيد تصدير وحدات `state` و`search` و`browse` و`collections` و`library` و`details` و`settings` (بلا اعتماد دائري) |
+| `desktop/frontend/vite.config.js` | يحقن سياسة CSP في الإصدار النهائي فقط (التطوير بلا تقييد لأن HMR يحتاج websocket) |
+| `desktop/frontend/tests/` | اختبارات الحالة وسياسة CSP (`npm test`) واختبار Chromium الحقيقي (`npm run test:e2e`) |
+| `core/cinemana/fixes_test.go`, `desktop/proxy_security_test.go` | اختبارات انحدار بلا شبكة للأمان والتحقق من المدخلات والوكيل |
+| `.github/workflows/ci.yml` | الـ CI: gofmt وvet واختبارات Go بـ `-race`، وبناء الواجهة واختباراتها، واختبار e2e |
 | `desktop/frontend/src/services/mock.js` | بيانات تجريبية لمعاينة الواجهة في متصفح عادي بلا تطبيق |
 | `desktop/frontend/src/assets/fonts/` | خطوط عربية مدمجة (Cairo، Amiri...) — تُحدَّث بـ `desktop/download_fonts.py` |
 | `desktop/icons/` + `desktop/update-icon.ps1` | أيقونة التطبيق: ضع `icon.ico` هنا ثم شغّل السكربت وأعد البناء |
@@ -84,3 +89,22 @@ cinemana-probe browse --type movie --cat 57 --star 9 --year-from 2020 --lang 9
 (تثبيت نطاق)، `--ua` و`--app-id` (ترويسات المحاكاة)، `--insecure`
 (تخطي TLS للشبكة المحلية). كل المخرجات JSON منسق، ورموز الخروج:
 `0` نجاح، `1` خطأ، `2` خطأ استخدام.
+
+## سياسة أمان المحتوى (CSP)
+
+تُحقن في `index.html` وقت البناء فقط (`npm run build`)، وتُعرَّف في `vite.config.js`:
+
+- `script-src 'self'`: لا سكربتات مضمنة ولا `eval`.
+- `connect-src` و`media-src`: الأصل نفسه + وكيل البث المحلي `http://127.0.0.1:*` (و`blob:` للوسائط).
+- `img-src https:`: بوسترات المزود الموقّعة. `worker-src blob:`: لـ hls.js.
+- `object-src`/`frame-src`/`base-uri`/`form-action`: `'none'`.
+
+عند إضافة اعتماد جديد للواجهة يحتاج مصدراً آخر (خط/صورة/اتصال)، عدّل `CSP` ثم شغّل
+`npm test` (يحمي الحدود الأساسية) و`npm run test:e2e` (يتأكد أن التطبيق يعمل تحت السياسة).
+
+## تواقيع روابط HLS الفرعية
+
+الروابط النسبية داخل قوائم m3u8 تُحل وفق RFC 3986 ولا ترث استعلام التوقيع من القائمة الأب.
+إن رفض الـ CDN رابطاً فرعياً بـ `401/403` يعيد الوكيل (`desktop/proxy.go`) المحاولة **مرة واحدة**
+بمعاملات توقيع القائمة الأب (تلميح `q` في رابط `/stream`)، ولا يلحقها افتراضياً. لم يُتحقق
+من حاجة الخدمة الحية لذلك؛ الخطة البديلة تجعل الحالتين تعملان.

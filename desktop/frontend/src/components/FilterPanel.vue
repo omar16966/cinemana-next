@@ -6,7 +6,7 @@
 // الفلاتر تعمل عبر نقطة AdvancedSearch (نجم الحد الأدنى/السنة/التصنيف)
 // وvideosByCategoryAndLanguage للغة — التفاصيل في core/cinemana/browse.go.
 // =============================================================================
-import { onMounted, reactive, ref } from 'vue'
+import { onMounted, toRef } from 'vue'
 import {
   store,
   applyFilters,
@@ -15,18 +15,10 @@ import {
   ensureCategories,
 } from '../store.js'
 
-const open = ref(true)
+const open = toRef(store, 'filterOpen')
 
-// الحالة المحلية للفلاتر (تُطبق عند الضغط على "تطبيق" — تجربة أسرع).
-const f = reactive({
-  query: '',
-  video_kind: '',
-  language_id: '',
-  category_id: '',
-  min_star: '',
-  year_from: '',
-  year_to: '',
-})
+// مسودة الفلاتر في المخزن (تبقى بعد مغادرة الرئيسية والعودة إليها).
+const f = store.filterDraft
 
 onMounted(() => ensureCategories())
 

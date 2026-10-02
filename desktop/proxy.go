@@ -192,6 +192,39 @@ func (s *Streamer) StreamURL(remote string) string {
 	return s.baseURL + "/stream?u=" + base64.RawURLEncoding.EncodeToString([]byte(remote))
 }
 
+// StreamURLHint مثل StreamURL مع تلميح اختياري: معاملات استعلام القائمة الأب
+// (التوقيع Expires/Signature في الروابط الموقّعة). تُستعمل فقط كخطة بديلة إن
+// رفض الـ CDN الرابط الفرعي بـ 401/403 لأنه بلا توقيع — لا تُلحق افتراضياً
+// فلا يتغير سلوك الـ CDN الذي لا يحتاجها.
+func (s *Streamer) StreamURLHint(remote, parentQuery string) string {
+	u := s.StreamURL(remote)
+	if u == "" || parentQuery == "" {
+		return u
+	}
+	return u + "&q=" + base64.RawURLEncoding.EncodeToString([]byte(parentQuery))
+}
+
+// decodeHint يفك معاملات التوقيع من q ويرفض ما ليس استعلاماً سليماً.
+func decodeHint(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil || len(b) == 0 || len(b) > 4096 {
+		return ""
+	}
+	q := string(b)
+	for _, r := range q {
+		if r < 0x20 || r == 0x7f || r == ' ' || r == '#' {
+			return ""
+		}
+	}
+	if _, err := url.ParseQuery(q); err != nil {
+		return ""
+	}
+	return q
+}
+
 // SubtitleURL مثل StreamURL لكن لنقطة /sub (تحويل إلى VTT).
 func (s *Streamer) SubtitleURL(remote string) string {
 	if s == nil || remote == "" {
@@ -311,6 +344,20 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "فشل جلب الوسائط من المزود", http.StatusBadGateway)
 		return
 	}
+
+	// خطة بديلة للروابط الفرعية غير الموقّعة: إن رُفض الرابط (401/403) وكان بلا
+	// استعلام وصلنا معه تلميح توقيع القائمة الأب، نعيد المحاولة مرة واحدة به.
+	if hint := decodeHint(r.URL.Query().Get("q")); hint != "" && target.RawQuery == "" &&
+		(resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+		retry := *target
+		retry.RawQuery = hint
+		if rReq, _, rerr := s.newUpstreamRequest(r, &retry, true); rerr == nil {
+			if rResp, derr := client.Do(rReq); derr == nil {
+				resp.Body.Close()
+				resp, target = rResp, &retry
+			}
+		}
+	}
 	defer resp.Body.Close()
 
 	// ---- حالة خاصة: قائمة m3u8 — نعيد كتابتها قبل إعادتها ----
@@ -328,7 +375,12 @@ func (s *Streamer) handleStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// بعد التحويلات قد يختلف الرابط النهائي: نحل الروابط النسبية ضده.
-		rewritten := rewriteM3U8(string(body), resp.Request.URL, s.StreamURL)
+		// استعلام الرابط الفعلي (بعد التحويلات/إعادة المحاولة) يُمرَّر كتلميح
+		// توقيع للروابط الفرعية.
+		parentQuery := resp.Request.URL.RawQuery
+		rewritten := rewriteM3U8(string(body), resp.Request.URL, func(u string) string {
+			return s.StreamURLHint(u, parentQuery)
+		})
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
