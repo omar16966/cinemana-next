@@ -45,13 +45,19 @@ for display, query in FAMILIES:
             continue
         family = m_fam.group(1)
         weight = m_wgt.group(1) if m_wgt else "400"
-        slug = family.lower().replace(" ", "-")
+        # اسم الملف يُبنى من نص قادم من الشبكة: نقيّده بأحرف آمنة (منع ../).
+        slug = re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
+        if not slug:
+            continue
         fname = "%s-%s.woff2" % (slug, subset)
         path = os.path.join(OUT, fname)
         if not os.path.exists(path):
             data = fetch(m_url.group(1))
-            with open(path, "wb") as f:
+            # كتابة ذرية: التحميل الفاشل لا يترك ملفاً مبتوراً يتخطاه التشغيل التالي.
+            tmp = path + ".part"
+            with open(tmp, "wb") as f:
                 f.write(data)
+            os.replace(tmp, path)
             downloaded += 1
         css_out.append(
             "@font-face {\n"
@@ -63,7 +69,7 @@ for display, query in FAMILIES:
             "  unicode-range: %s;\n"
             "}" % (family, weight, fname, m_rng.group(1).strip())
         )
-    print("done:", family)
+    print("done:", display)
 
 with open(os.path.join(OUT, "fonts.css"), "w", encoding="utf-8") as f:
     f.write("/* خطوط عربية مدمجة محلياً (OFL - Google Fonts) — تُنتج بـ download_fonts.py */\n")

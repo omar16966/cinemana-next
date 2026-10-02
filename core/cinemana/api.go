@@ -15,13 +15,33 @@ package cinemana
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+// maxAPIBody سقف حجم استجابة JSON واحدة.
+const maxAPIBody = 32 << 20
+
+// idPattern معرّفات الخدمة (nb) أرقام فقط؛ نرفض غيرها قبل بناء المسار
+// (يمنع ".." أو "/" داخل المعرّف).
+var idPattern = regexp.MustCompile(`^[0-9]{1,18}$`)
+
+// ErrInvalidID معرّف عمل غير صالح.
+var ErrInvalidID = errors.New("معرّف العمل غير صالح")
+
+func checkID(nb string) (string, error) {
+	nb = strings.TrimSpace(nb)
+	if !idPattern.MatchString(nb) {
+		return "", fmt.Errorf("%w: %q", ErrInvalidID, nb)
+	}
+	return nb, nil
+}
 
 // مسارات نقاط النهاية (تُلحق بالعنوان الأساسي).
 const (
@@ -176,15 +196,20 @@ func getJSON(ctx context.Context, client *http.Client, opts ClientOptions, endpo
 
 	// نقرأ الجسم كاملاً ثم نفك الترميز حتى نستطيع عرض رسالة خطأ واضحة
 	// عند إرجاع HTML بدل JSON (مثل صفحة خطأ من الشبكة المحلية).
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20)) // سقف 32 ميغابايت احتياطاً
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIBody+1))
 	if err != nil {
 		return meta, err
+	}
+	if len(body) > maxAPIBody {
+		return meta, fmt.Errorf("الاستجابة من %s أكبر من الحد المسموح (%d ميغابايت)", endpoint, maxAPIBody>>20)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return meta, fmt.Errorf("HTTP %d من %s: %.200s", resp.StatusCode, endpoint, strings.TrimSpace(string(body)))
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return meta, fmt.Errorf("تعذر تحليل JSON من %s: %w", resp.Request.URL.String(), err)
+		// صفحة HTML بحالة 200 (بوابة مزود/صفحة تسجيل دخول) شائعة: نعرض مقتطفاً
+		// من الجسم ليظهر السبب الحقيقي بدل "invalid character '<'" المبهمة.
+		return meta, fmt.Errorf("تعذر تحليل JSON من %s: %w (بداية الاستجابة: %.120q)", resp.Request.URL.String(), err, strings.TrimSpace(string(body)))
 	}
 	return meta, nil
 }
@@ -209,6 +234,10 @@ func Search(ctx context.Context, client *http.Client, opts ClientOptions, title,
 
 // GetVideoInfo يجلب تفاصيل عمل عبر معرّفه nb.
 func GetVideoInfo(ctx context.Context, client *http.Client, opts ClientOptions, nb string) (*VideoInfo, Meta, error) {
+	nb, err := checkID(nb)
+	if err != nil {
+		return nil, Meta{}, err
+	}
 	endpoint := strings.TrimRight(opts.BaseURL, "/") + PathVideoInfo + url.PathEscape(nb)
 	var info VideoInfo
 	meta, err := getJSON(ctx, client, opts, endpoint, &info)
@@ -220,6 +249,10 @@ func GetVideoInfo(ctx context.Context, client *http.Client, opts ClientOptions, 
 
 // GetVideoFiles يجلب روابط الفيديو المباشرة بجوداتها لمعرّف nb.
 func GetVideoFiles(ctx context.Context, client *http.Client, opts ClientOptions, nb string) ([]VideoFile, Meta, error) {
+	nb, err := checkID(nb)
+	if err != nil {
+		return nil, Meta{}, err
+	}
 	endpoint := strings.TrimRight(opts.BaseURL, "/") + PathVideoFiles + url.PathEscape(nb)
 	var files []VideoFile
 	meta, err := getJSON(ctx, client, opts, endpoint, &files)
@@ -228,6 +261,10 @@ func GetVideoFiles(ctx context.Context, client *http.Client, opts ClientOptions,
 
 // GetEpisodes يجلب كل حلقات مسلسل (مع أرقام المواسم والحلقات).
 func GetEpisodes(ctx context.Context, client *http.Client, opts ClientOptions, seriesNB string) ([]Episode, Meta, error) {
+	seriesNB, err := checkID(seriesNB)
+	if err != nil {
+		return nil, Meta{}, err
+	}
 	endpoint := strings.TrimRight(opts.BaseURL, "/") + PathVideoSeason + url.PathEscape(seriesNB)
 	var episodes []Episode
 	meta, err := getJSON(ctx, client, opts, endpoint, &episodes)

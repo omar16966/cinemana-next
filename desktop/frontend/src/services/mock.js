@@ -136,7 +136,7 @@ export async function categories() {
 // تصدير/استيراد (وضع المعاينة: محاكاة فقط)
 export async function exportUserData() {
   await wait()
-  return 'C:\mock\cinemana-next-data.json'
+  return 'C:\\mock\\cinemana-next-data.json'
 }
 export async function importUserData() {
   await wait()

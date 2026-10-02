@@ -52,6 +52,9 @@ const cardItem = computed(() => details.value && ({
   rating: details.value.rating,
   poster_url: details.value.poster_url,
   thumbnail_url: details.value.thumbnail_url,
+  // alts وcategories من العنصر الأصلي: تبقى نسخ التشغيل البديلة متاحة من المفضلة/القوائم.
+  alts: store.currentItem?.alts || [],
+  categories: details.value.categories || store.currentItem?.categories || [],
 }))
 
 function addToList(listId) {
@@ -123,7 +126,7 @@ function createAndAdd() {
               class="flex shrink-0 items-center justify-center self-start rounded-xl bg-ink-700 text-5xl font-black text-ink-600"
               :class="isSeries ? 'h-40 w-24 sm:w-28' : 'h-56 w-36 sm:w-48'"
             >
-              {{ details.title.charAt(0) }}
+              {{ (details.title || '').charAt(0) }}
             </div>
 
             <div class="min-w-0">
@@ -310,7 +313,7 @@ function createAndAdd() {
             <div v-else class="flex flex-1 items-center justify-between gap-3">
               <span class="text-sm text-zinc-400">تعذر جلب معلومات التشغيل — تأكد من اتصالك بشبكة مزود الخدمة.</span>
               <button
-                @click="preparePlayback(details.id, store.currentItem?.alts || [])"
+                @click="store.activeEpisode ? preparePlayback(store.activeEpisode.id) : preparePlayback(details.id, store.currentItem?.alts || [])"
                 class="shrink-0 rounded-lg bg-accent-500 px-5 py-2 text-sm font-bold text-white transition hover:bg-accent-400"
               >
                 إعادة المحاولة

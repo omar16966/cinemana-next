@@ -22,6 +22,7 @@ package cinemana
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -29,6 +30,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // ClientOptions كل ما يمكن ضبطه في العميل من سطر الأوامر.
@@ -64,6 +67,10 @@ func DefaultOptions() ClientOptions {
 // BuildClient يبني http.Client جاهزاً حسب الخيارات أعلاه، ويعيد أيضاً
 // الـ resolver لاستخدامه في أمر probe (عرض عناوين IP التي تم حلها).
 func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
+	// مهلة صفرية أو سالبة كانت تعطّل كل المهلات (طلب معلّق للأبد): نعود للافتراضي.
+	if opts.Timeout <= 0 {
+		opts.Timeout = DefaultOptions().Timeout
+	}
 	// ---------------------------------------------------------------------------
 	// 1) محلل DNS المحلي
 	// ---------------------------------------------------------------------------
@@ -83,8 +90,9 @@ func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
 	if opts.DNSServer != "" {
 		// إذا حدّد المستخدم خادم DNS محلياً نعيد توجيه كل استعلامات DNS إليه.
 		server := opts.DNSServer
-		if !strings.Contains(server, ":") {
-			server += ":53" // البورت القياسي لـ DNS إن لم يُحدد
+		if _, _, err := net.SplitHostPort(server); err != nil {
+			// بلا منفذ (يشمل IPv6 مثل ::1 أو [::1]): نضيف البورت القياسي.
+			server = net.JoinHostPort(strings.Trim(server, "[]"), "53")
 		}
 		resolver = &net.Resolver{
 			PreferGo: true,
@@ -129,7 +137,9 @@ func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
 
 		ForceAttemptHTTP2:     true, // الدخول للمحتوى عبر HTTP/2 عند توفره (كما في تطبيقات الأندرويد الحديثة)
 		MaxIdleConns:          20,   // تجمع اتصالات لإعادة الاستخدام (أسرع في الأوامر المتسلسلة)
+		MaxIdleConnsPerHost:   8,    // الافتراضي 2 يخنق الطلبات المتوازية نحو نفس المضيف
 		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: opts.Timeout, // خادم يقبل الاتصال ولا يرد لا يعلّق الطلب
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
 		TLSClientConfig: &tls.Config{
@@ -141,7 +151,8 @@ func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
 
 	// وعاء كوكيز في الذاكرة: بعض نقاط النهاية تضبط كوكيز جلسة أثناء
 	// إعادة التوجيه (من .com إلى .cc)؛ الاحتفاظ بها يزيد التوافق.
-	jar, err := cookiejar.New(nil)
+	// قائمة اللواحق العامة تمنع خادماً من وضع كوكي على نطاق مثل ‎.cc كاملاً.
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -150,8 +161,17 @@ func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
 		Transport: transport,
 		Timeout:   opts.Timeout,
 		Jar:       jar,
-		// نستخدم سياسة التوجيه الافتراضية: تتبع حتى 10 قفزات (302...)،
-		// وهذا مطلوب لأن النطاق الأساسي يحوّل إلى shabakaty.cc.
+		// نتبع حتى 10 قفزات (302...) لأن النطاق الأساسي يحوّل إلى
+		// shabakaty.cc، لكن نرفض التحويل من https إلى http (تخفيض التشفير).
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("تحويلات كثيرة (أكثر من 10)")
+			}
+			if len(via) > 0 && via[len(via)-1].URL.Scheme == "https" && req.URL.Scheme != "https" {
+				return fmt.Errorf("رُفض تحويل من https إلى %s", req.URL.Scheme)
+			}
+			return nil
+		},
 	}
 	return client, resolver, nil
 }
@@ -161,7 +181,10 @@ func BuildClient(opts ClientOptions) (*http.Client, *net.Resolver, error) {
 func DoRequest(ctx context.Context, client *http.Client, opts ClientOptions, method, rawURL string, extra map[string]string) (*http.Response, error) {
 	// تنظيف الروابط: بعض حقول الـ JSON تحتوي شرطات مائلة معكوسة "\"
 	// (سلوك ملاحظ في التطبيق المرجعي) فنزيلها قبل التحليل.
-	rawURL = strings.ReplaceAll(rawURL, "\\", "")
+	rawURL = CleanURL(rawURL)
+	if u, perr := url.Parse(rawURL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("رابط غير صالح أو مخطط غير مدعوم: %q", rawURL)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 	if err != nil {
@@ -193,6 +216,13 @@ func DoRequest(ctx context.Context, client *http.Client, opts ClientOptions, met
 	return client.Do(req)
 }
 
+// CleanURL يزيل الشرطات المائلة المعكوسة التي تظهر في بعض حقول JSON
+// (سلوك ملاحظ في التطبيق المرجعي) ويقص المسافات المحيطة. نقطة التنظيف
+// الوحيدة لكل الروابط القادمة من الخدمة.
+func CleanURL(raw string) string {
+	return strings.TrimSpace(strings.ReplaceAll(raw, "\\", ""))
+}
+
 // ParseResolveFlags تحويل قيم --resolve الممررة كـ "host=ip,host2=ip2" إلى خريطة.
 func ParseResolveFlags(values []string) (map[string]string, error) {
 	out := make(map[string]string)
@@ -217,6 +247,7 @@ func ParseResolveFlags(values []string) (map[string]string, error) {
 
 // NormalizeBaseURL يضمن أن العنوان الأساسي يحمل مخططاً صالحاً ويُزيل أي مسار زائد.
 func NormalizeBaseURL(s string) (string, error) {
+	s = strings.TrimSpace(s)
 	if !strings.Contains(s, "://") {
 		s = "https://" + s
 	}
@@ -224,7 +255,15 @@ func NormalizeBaseURL(s string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("المخطط %q غير مدعوم؛ استخدم http أو https", u.Scheme)
+	}
+	if u.Hostname() == "" {
+		return "", errors.New("العنوان لا يحوي اسم مضيف")
+	}
+	u.User = nil // لا نحتفظ بأي بيانات اعتماد داخل العنوان
 	u.Path = ""
+	u.RawPath = ""
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil

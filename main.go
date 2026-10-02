@@ -32,12 +32,21 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"time"
 
 	cinemana "cinemana-probe/core/cinemana"
 )
+
+// knownCommands الأوامر المدعومة (للتحقق قبل بناء العميل).
+var knownCommands = map[string]bool{
+	"probe": true, "search": true, "details": true, "videos": true,
+	"seasons": true, "all": true, "collection": true, "browse": true,
+}
 
 // usageError خطأ في مدخلات المستخدم (يُخرج رمز خروج 2).
 type usageError struct{ msg string }
@@ -176,6 +185,11 @@ func main() {
 		return
 	}
 
+	if !knownCommands[command] {
+		printJSON(Envelope{Command: command, Error: &ErrInfo{Message: "أمر غير معروف: " + command + " (استخدم help)"}})
+		os.Exit(2)
+	}
+
 	var opts cliOptions
 	fs := flag.NewFlagSet(command, flag.ExitOnError)
 	addFlags(fs, &opts)
@@ -214,8 +228,14 @@ func main() {
 		os.Exit(1)
 	}
 	// السياق مع مهلة إجمالية سخية (أوامر مثل all تنفذ عدة طلبات متتالية).
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	// Ctrl-C يلغي الطلبات الجارية فيخرج غلاف JSON سليم بدل قطع بلا مخرجات.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	ctx, cancel := context.WithTimeout(sigCtx, 3*time.Minute)
 	defer cancel()
+	if def.InsecureTLS {
+		fmt.Fprintln(os.Stderr, "تحذير: التحقق من شهادة TLS معطّل (--insecure) لكل الطلبات.")
+	}
 
 	start := time.Now()
 	runErr := dispatch(ctx, command, client, resolver, def, opts, args, &env)
@@ -232,7 +252,9 @@ func main() {
 		env.Error = info
 		printJSON(env)
 		var ue *usageError
-		if errors.As(runErr, &ue) {
+		var fe *cinemana.FilterError
+		if errors.As(runErr, &ue) || errors.As(runErr, &fe) ||
+			errors.Is(runErr, cinemana.ErrUnknownCollection) || errors.Is(runErr, cinemana.ErrInvalidID) {
 			os.Exit(2)
 		}
 		os.Exit(1)
@@ -275,13 +297,19 @@ func dispatch(ctx context.Context, command string, client *http.Client, resolver
 		if len(args) < 1 {
 			return &usageError{msg: "الاستخدام: cinemana-probe collection <key> [limit] — مثال: top_movies، latest_movies_arabic"}
 		}
-		return runCollection(ctx, client, def, args[0], env)
+		limit := 12
+		if len(args) > 1 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n < 1 {
+				return &usageError{msg: "limit يجب أن يكون عدداً موجباً: " + args[1]}
+			}
+			limit = n
+		}
+		return runCollection(ctx, client, def, args[0], limit, env)
 	case "browse":
 		return runBrowse(ctx, client, def, opts, args, env)
 	default:
-		usage()
-		os.Exit(2)
-		return nil
+		return &usageError{msg: "أمر غير معروف: " + command}
 	}
 }
 
@@ -318,12 +346,9 @@ func runVideos(ctx context.Context, client *http.Client, opts cinemana.ClientOpt
 	if err != nil {
 		return wrapMeta(err, meta)
 	}
-	out, err := cinemana.NormalizeVideos(ctx, client, opts, nb, files)
+	out, err := cinemana.NormalizeVideosWith(ctx, client, opts, nb, files, parseHLS)
 	if err != nil {
 		return err
-	}
-	if !parseHLS {
-		out.HLS = nil
 	}
 	// إن لم تأتِ ترجمات مع ملفات الفيديو نلجأ إلى ترجمات تفاصيل العمل.
 	if len(out.Subtitles) == 0 {
@@ -374,7 +399,7 @@ func runAll(ctx context.Context, client *http.Client, opts cinemana.ClientOption
 	if err != nil {
 		return wrapMeta(err, vmeta)
 	}
-	videos, err := cinemana.NormalizeVideos(ctx, client, opts, pick.NB, files)
+	videos, err := cinemana.NormalizeVideosWith(ctx, client, opts, pick.NB, files, !o.noHLSParse)
 	if err != nil {
 		return err
 	}
@@ -401,8 +426,8 @@ func runAll(ctx context.Context, client *http.Client, opts cinemana.ClientOption
 }
 
 // runCollection أمر collection: جلب قائمة استعراض جاهزة (صفوف الرئيسية وTop).
-func runCollection(ctx context.Context, client *http.Client, opts cinemana.ClientOptions, key string, env *Envelope) error {
-	items, err := cinemana.GetCollection(ctx, client, opts, cinemana.CollectionKey(key), 12)
+func runCollection(ctx context.Context, client *http.Client, opts cinemana.ClientOptions, key string, limit int, env *Envelope) error {
+	items, err := cinemana.GetCollection(ctx, client, opts, cinemana.CollectionKey(key), limit)
 	if err != nil {
 		return err
 	}
@@ -482,6 +507,7 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 			Server      string   `json:"server_used"`
 			Note        string   `json:"note"`
 			ResolvedIPs []string `json:"resolved_ips,omitempty"`
+			Error       string   `json:"error,omitempty"`
 		} `json:"dns"`
 		Checks []check `json:"checks"`
 	}
@@ -496,11 +522,13 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 		data.DNS.Note = "محلل نظام التشغيل الافتراضي (على ويندوز: خدمة DNS Client مع ذاكرة مؤقتة، بلا DoH)"
 	}
 
-	host := strings.TrimPrefix(strings.TrimPrefix(opts.BaseURL, "https://"), "http://")
+	host := hostOf(opts.BaseURL)
 
-	// 1) حل النطاق الأساسي عبر DNS المحلي.
+	// 1) حل النطاق الأساسي عبر DNS المحلي (الخطأ جزء من التشخيص: نعرضه).
 	if ips, err := resolver.LookupHost(ctx, host); err == nil {
 		data.DNS.ResolvedIPs = ips
+	} else {
+		data.DNS.Error = err.Error()
 	}
 
 	doCheck := func(name, url string, body func() (int, string, string, error)) check {
@@ -530,6 +558,9 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 		// نتبدد الجسم فقط؛ الهدف قياس الوصول وليس قراءة الصفحة.
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		detail := "HTTP " + resp.Status
+		if resp.StatusCode >= 400 { // 403/503 ليست "وصولاً ناجحاً"
+			return resp.StatusCode, resp.Request.URL.String(), detail, errors.New(detail)
+		}
 		return resp.StatusCode, resp.Request.URL.String(), detail, nil
 	})
 	data.Checks = append(data.Checks, c1)
@@ -539,6 +570,8 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 		if fh := hostOf(c1.FinalURL); fh != "" && !strings.EqualFold(fh, host) {
 			if ips, err := resolver.LookupHost(ctx, fh); err == nil {
 				data.DNS.ResolvedIPs = append(data.DNS.ResolvedIPs, ips...)
+			} else if data.DNS.Error == "" {
+				data.DNS.Error = fh + ": " + err.Error()
 			}
 		}
 	}
@@ -558,7 +591,7 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 	// 4) نقطة ملفات الفيديو بمعرّف حقيقي من نتائج البحث.
 	if c2.OK && len(searchItems) > 0 {
 		nb := searchItems[0].NB
-		fURL := strings.TrimRight(opts.BaseURL, "/") + cinemana.PathVideoFiles + nb
+		fURL := strings.TrimRight(opts.BaseURL, "/") + cinemana.PathVideoFiles + url.PathEscape(nb)
 		c3 := doCheck("video_files_endpoint", fURL, func() (int, string, string, error) {
 			files, meta, err := cinemana.GetVideoFiles(ctx, client, opts, nb)
 			if err != nil {
@@ -570,26 +603,22 @@ func runProbe(ctx context.Context, client *http.Client, resolver *net.Resolver, 
 	}
 
 	env.Data = data
+	// أداة تشخيص: أي فحص فاشل يعني رمز خروج غير صفري (والبيانات تبقى في المخرجات).
+	for _, c := range data.Checks {
+		if !c.OK {
+			return fmt.Errorf("فشل الفحص: %s", c.Name)
+		}
+	}
 	return nil
 }
 
-// hostOf استخراج النطاق من رابط (تسامحي — للعرض التشخيصي فقط).
+// hostOf استخراج اسم المضيف (بلا منفذ أو بيانات اعتماد) من رابط.
 func hostOf(raw string) string {
-	i := strings.Index(raw, "://")
-	if i < 0 {
+	u, err := url.Parse(raw)
+	if err != nil {
 		return ""
 	}
-	rest := raw[i+3:]
-	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
-		rest = rest[:j]
-	}
-	if k := strings.LastIndex(rest, "@"); k >= 0 {
-		rest = rest[k+1:]
-	}
-	if k := strings.LastIndex(rest, ":"); k >= 0 && !strings.Contains(rest, "]") {
-		rest = rest[:k]
-	}
-	return rest
+	return u.Hostname()
 }
 
 // usage عرض المساعدة بالعربية.
@@ -606,6 +635,8 @@ func usage() {
   videos <id>              روابط الفيديو المباشرة مع الجودات والترجمات
   seasons <id>             مواسم المسلسل وحلقاته
   all "عنوان"              بحث ثم تفاصيل وروابط للنتيجة الأولى (--index i)
+  collection <key> [limit] قائمة جاهزة: top_movies، latest_movies_arabic ...
+  browse ["نص"]            تصفح بفلاتر (--cat --lang --star --year-from --year-to --page)
 
 الخيارات المشتركة:
   --base-url URL           العنوان الأساسي (افتراضياً https://cinemana.shabakaty.com)

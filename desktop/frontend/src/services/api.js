@@ -12,58 +12,74 @@
 // إلى بيانات تجريبية من mock.js — يتيح تطوير/فحص الواجهة بلا تطبيق.
 // =============================================================================
 
-import * as mock from './mock.js'
+// الوضع التجريبي (mock) يُحمَّل ديناميكياً وفي التطوير فقط (npm run dev):
+// الإصدار النهائي لا يحوي بيانات وهمية، وغياب الربط فيه خطأ صريح بدل
+// عرض بيانات مزيفة بصمت. Vite يحذف الفرع كاملاً من حزمة الإنتاج.
+const NO_BACKEND = 'تعذر الاتصال بالتطبيق الخلفي (Wails) — أعد تشغيل التطبيق'
 
 // backend يعيد كائن الربط إن كنا داخل Wails، أو null في المتصفح.
 function backend() {
-  return typeof window !== 'undefined' && window.go && window.go.main.App
-    ? window.go.main.App
-    : null
+  return typeof window !== 'undefined' ? window.go?.main?.App ?? null : null
 }
 
-// استدعاء موحد: يوجه للباك-اند الحقيقي أو للوضع التجريبي.
-async function call(method, mockFn, ...args) {
+// مهلة قصوى لأي استدعاء: استدعاء Go معلّق لا يترك الواجهة في حالة تحميل أبدية.
+const CALL_TIMEOUT_MS = 60_000
+
+function withTimeout(promise, ms, method) {
+  let timer
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`انتهت مهلة العملية (${method})`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+// استدعاء موحد: يوجه للباك-اند الحقيقي أو للوضع التجريبي (تطوير فقط).
+async function call(method, mockName, ...args) {
   const b = backend()
   if (b) {
-    return b[method](...args) // مثال: App.Search("فاست", "movie", 1)
+    return withTimeout(Promise.resolve(b[method](...args)), CALL_TIMEOUT_MS, method) // مثال: App.Search("فاست", "movie", 1)
   }
-  return mockFn(...args)
+  if (import.meta.env.DEV) {
+    const mock = await import('./mock.js')
+    return mock[mockName](...args)
+  }
+  throw new Error(NO_BACKEND)
 }
 
 /** بحث عن فيلم/مسلسل. يعيد: [ {id, ar_title, en_title, type, year, rating, poster_url, ...} ] */
 export const search = (query, mediaType, page) =>
-  call('Search', mock.search, query, mediaType, page)
+  call('Search', 'search', query, mediaType, page)
 
 /** تفاصيل عمل كاملة: عنوان/وصف/سنة/بوستر/ترجمات/تصنيفات. */
-export const details = (nb) => call('GetDetails', mock.details, nb)
+export const details = (nb) => call('GetDetails', 'details', nb)
 
 /** مواسم مسلسل وحلقاته: [ {season, episodes:[{id, episode_number, title, duration_sec}]} ] */
-export const episodes = (nb) => call('GetEpisodes', mock.episodes, nb)
+export const episodes = (nb) => call('GetEpisodes', 'episodes', nb)
 
 /** معلومات التشغيل: جودات (local_url للمشغل المدمج، remote_url للخارجي) + ترجمات VTT. */
-export const playback = (nb, alts) => call('GetPlayback', mock.playback, nb, alts || [])
+export const playback = (nb, alts) => call('GetPlayback', 'playback', nb, alts || [])
 
 /** فتح الرابط في مشغل mpv الخارجي مع تمرير الترويسات (يجري في Go). */
 export const openInMPV = (videoUrl, subtitleUrl, title) =>
-  call('OpenInMPV', mock.openInMPV, videoUrl, subtitleUrl, title)
+  call('OpenInMPV', 'openInMPV', videoUrl, subtitleUrl, title)
 
 /** قراءة الإعدادات المحفوظة (مسار mpv، العنوان الأساسي، User-Agent). */
-export const getSettings = () => call('GetSettings', mock.getSettings)
+export const getSettings = () => call('GetSettings', 'getSettings')
 
 /** حفظ الإعدادات وتفعيلها فوراً في الباك-اند. */
-export const saveSettings = (s) => call('SaveSettings', mock.saveSettings, s)
+export const saveSettings = (s) => call('SaveSettings', 'saveSettings', s)
 
 /** قائمة استعراض جاهزة (صفوف الرئيسية وقوائم Top): latest_movies_arabic، top_anime... */
-export const collection = (key, limit) => call('GetCollection', mock.collection, key, limit)
+export const collection = (key, limit) => call('GetCollection', 'collection', key, limit)
 
 /** تصفح بفلاتر لوحة اليمين: {query, video_kind, category_id, language_id, min_star, year_from, year_to, page} */
-export const browse = (filters) => call('Browse', mock.browse, filters)
+export const browse = (filters) => call('Browse', 'browse', filters)
 
 /** تصنيفات الخدمة (للقائمة المنسدلة في لوحة الفلترة). */
-export const categories = () => call('GetCategories', mock.categories)
+export const categories = () => call('GetCategories', 'categories')
 
 /** تصدير بيانات المستخدم إلى ملف JSON (حوار حفظ في Go). */
-export const exportUserData = (dataJson) => call('ExportUserData', mock.exportUserData, dataJson)
+export const exportUserData = (dataJson) => call('ExportUserData', 'exportUserData', dataJson)
 
 /** استيراد بيانات المستخدم من ملف JSON (حوار اختيار في Go). */
-export const importUserData = () => call('ImportUserData', mock.importUserData)
+export const importUserData = () => call('ImportUserData', 'importUserData')
